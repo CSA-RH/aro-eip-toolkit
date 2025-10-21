@@ -451,9 +451,16 @@ generate_plot() {
     local input_file=$1
     local title=$2
     
-    # Create plots subdirectory in the same location as the data files
-    local data_dir=$(dirname "$input_file")
-    local plots_dir="${data_dir}/plots"
+    # Determine the main project directory (go up from data/ if needed)
+    local data_file_dir=$(dirname "$input_file")
+    local main_dir="$data_file_dir"
+    
+    # If we're in a data/ subdirectory, go up one level for plots
+    if [[ "$(basename "$data_file_dir")" == "data" ]]; then
+        main_dir=$(dirname "$data_file_dir")
+    fi
+    
+    local plots_dir="${main_dir}/plots"
     
     # Create plots directory if it doesn't exist
     mkdir -p "$plots_dir"
@@ -507,8 +514,14 @@ process_all_plot_files() {
     local processed=0
     local failed=0
     
-    # Create plots subdirectory info message
-    local plots_dir="${DATA_DIR_ABS}/plots"
+    # Determine correct plots directory (should be in main directory, not data subdirectory)
+    local main_dir="$DATA_DIR_ABS"
+    if [[ -d "$DATA_DIR_ABS/data" ]] && [[ ! -f "$DATA_DIR_ABS"/*.dat ]]; then
+        # If we have data/ subdirectory and no .dat files in main dir, main dir is correct
+        main_dir="$DATA_DIR_ABS"
+    fi
+    
+    local plots_dir="${main_dir}/plots"
     echo "Plots will be saved to: $plots_dir"
     echo ""
     
