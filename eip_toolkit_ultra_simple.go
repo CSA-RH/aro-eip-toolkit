@@ -51,7 +51,7 @@ func runAZ(cmd []string) (interface{}, error) {
 
 // getEIPStats returns assigned and configured EIP counts
 func getEIPStats() (int, int, error) {
-	data, err := runOC([]string{"get", "eip", "-o", "json"})
+	data, err := runOC([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return 0, 0, err
 	}
@@ -61,7 +61,9 @@ func getEIPStats() (int, int, error) {
 		return 0, 0, fmt.Errorf("invalid items format")
 	}
 
-	configured := len(items)
+	// Count configured EIPs: sum up the number of IPs in spec.egressIPs for each EIP resource
+	// Each EIP resource can have multiple IPs configured (e.g., 2 IPs per namespace)
+	configured := 0
 	assigned := 0
 
 	for _, item := range items {
@@ -70,14 +72,23 @@ func getEIPStats() (int, int, error) {
 			continue
 		}
 
+		// Count IPs in spec.egressIPs
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				configured += len(egressIPs)
+			}
+		}
+
+		// Count assigned IPs from status.items
 		status, ok := itemMap["status"].(map[string]interface{})
 		if !ok {
 			continue
 		}
 
 		statusItems, ok := status["items"].([]interface{})
-		if ok && len(statusItems) > 0 {
-			assigned++
+		if ok {
+			assigned += len(statusItems)
 		}
 	}
 
@@ -86,7 +97,7 @@ func getEIPStats() (int, int, error) {
 
 // getCPICStats returns successful CPIC count
 func getCPICStats() (int, error) {
-	data, err := runOC([]string{"get", "cloudprivateipconfig", "-o", "json"})
+	data, err := runOC([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return 0, err
 	}

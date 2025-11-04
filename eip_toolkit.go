@@ -287,7 +287,7 @@ func (oc *OpenShiftClient) GetEIPEnabledNodes() ([]string, error) {
 }
 
 func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
-	data, err := oc.RunCommand([]string{"get", "eip", "-o", "json"})
+	data, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +297,9 @@ func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
 		return nil, fmt.Errorf("invalid items format")
 	}
 
-	configured := len(items)
+	// Count configured EIPs: sum up the number of IPs in spec.egressIPs for each EIP resource
+	// Each EIP resource can have multiple IPs configured (e.g., 2 IPs per namespace)
+	configured := 0
 	assigned := 0
 	unassigned := 0
 
@@ -307,19 +309,27 @@ func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
 			continue
 		}
 
+		// Count IPs in spec.egressIPs (each EIP resource can have multiple IPs)
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				configured += len(egressIPs)
+			}
+		}
+
+		// Count assigned IPs from status.items (each item represents an assigned IP)
 		status, ok := itemMap["status"].(map[string]interface{})
 		if !ok {
-			unassigned++
 			continue
 		}
 
 		statusItems, ok := status["items"].([]interface{})
-		if ok && len(statusItems) > 0 {
-			assigned++
-		} else {
-			unassigned++
+		if ok {
+			assigned += len(statusItems)
 		}
 	}
+
+	unassigned = configured - assigned
 
 	return &EIPStats{
 		Configured: configured,
@@ -329,7 +339,7 @@ func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
 }
 
 func (oc *OpenShiftClient) GetCPICStats() (*CPICStats, error) {
-	data, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "-o", "json"})
+	data, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
@@ -390,7 +400,7 @@ func (oc *OpenShiftClient) GetCPICStats() (*CPICStats, error) {
 
 func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	// Get CPIC stats for the node
-	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "-o", "json"})
+	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
@@ -446,7 +456,7 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	}
 
 	// Get EIP stats for the node
-	eipData, err := oc.RunCommand([]string{"get", "eip", "-o", "json"})
+	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}

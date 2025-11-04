@@ -99,7 +99,7 @@ func runAZCommand(cmd []string) (interface{}, error) {
 
 // getEIPStats returns EIP statistics
 func getEIPStats() (map[string]int, error) {
-	data, err := runOCCommand([]string{"get", "eip", "-o", "json"})
+	data, err := runOCCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,9 @@ func getEIPStats() (map[string]int, error) {
 		return nil, fmt.Errorf("invalid items format")
 	}
 
-	configured := len(items)
+	// Count configured EIPs: sum up the number of IPs in spec.egressIPs for each EIP resource
+	// Each EIP resource can have multiple IPs configured (e.g., 2 IPs per namespace)
+	configured := 0
 	assigned := 0
 	unassigned := 0
 
@@ -119,19 +121,27 @@ func getEIPStats() (map[string]int, error) {
 			continue
 		}
 
+		// Count IPs in spec.egressIPs
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				configured += len(egressIPs)
+			}
+		}
+
+		// Count assigned IPs from status.items
 		status, ok := itemMap["status"].(map[string]interface{})
 		if !ok {
-			unassigned++
 			continue
 		}
 
 		statusItems, ok := status["items"].([]interface{})
-		if ok && len(statusItems) > 0 {
-			assigned++
-		} else {
-			unassigned++
+		if ok {
+			assigned += len(statusItems)
 		}
 	}
+
+	unassigned = configured - assigned
 
 	return map[string]int{
 		"configured": configured,
@@ -142,7 +152,7 @@ func getEIPStats() (map[string]int, error) {
 
 // getCPICStats returns CPIC statistics
 func getCPICStats() (map[string]int, error) {
-	data, err := runOCCommand([]string{"get", "cloudprivateipconfig", "-o", "json"})
+	data, err := runOCCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
@@ -300,7 +310,7 @@ func runMonitor() error {
 		// Monitor individual nodes
 		for _, node := range nodes {
 			// Get node-specific EIP stats
-			eipData, err := runOCCommand([]string{"get", "eip", "-o", "json"})
+			eipData, err := runOCCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 			if err != nil {
 				log.Printf("Error monitoring node %s: %v", node, err)
 				continue
@@ -339,7 +349,7 @@ func runMonitor() error {
 			}
 
 			// Get node-specific CPIC stats
-			cpicData, err := runOCCommand([]string{"get", "cloudprivateipconfig", "-o", "json"})
+			cpicData, err := runOCCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
 			if err != nil {
 				log.Printf("Error monitoring node %s: %v", node, err)
 				continue
