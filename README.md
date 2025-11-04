@@ -1,13 +1,14 @@
-# EIP Toolkit
+# EIP Toolkit - Go Implementation
 
-Python toolkit for monitoring Azure Red Hat OpenShift Egress IP assignments and CloudPrivateIPConfig status.
+Go toolkit for monitoring Azure Red Hat OpenShift Egress IP assignments and CloudPrivateIPConfig status.
 
 ## Installation
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+go mod download
+make build-main
+# Or manually:
+go build -o eip-toolkit eip_toolkit.go
 ```
 
 Set environment variables:
@@ -22,25 +23,25 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 
 ```bash
 # Monitor EIP and CPIC status
-python3 eip_toolkit.py monitor
+./eip-toolkit monitor
 
 # Process log files into structured data
-python3 eip_toolkit.py merge <directory>
+./eip-toolkit merge <directory>
 
-# Generate plots from data files
-python3 eip_toolkit.py plot <directory>
+# Generate plots from data files (requires external tools)
+./eip-toolkit plot <directory>
 
 # Complete pipeline: monitor → merge → plot
-python3 eip_toolkit.py all
+./eip-toolkit all
 
-# Async monitoring (parallel processing)
-python3 eip_toolkit.py monitor-async
+# Async monitoring (parallel processing via goroutines)
+./eip-toolkit monitor-async
 
-# Optimized merge (pandas-based)
-python3 eip_toolkit.py merge-optimized <directory>
+# Optimized merge
+./eip-toolkit merge-optimized <directory>
 
 # Optimized pipeline
-python3 eip_toolkit.py all-optimized
+./eip-toolkit all-optimized
 ```
 
 ### Output Structure
@@ -49,7 +50,7 @@ python3 eip_toolkit.py all-optimized
 ../runs/YYMMDD_HHMMSS/
 ├── logs/           # Raw timestamped log files
 ├── data/           # Processed .dat files
-└── plots/          # Generated PNG plots
+└── plots/          # Generated PNG plots (requires external tools)
 ```
 
 ## Architecture
@@ -89,12 +90,13 @@ EIPMonitor → Log Files → DataProcessor → Data Files (.dat) → PlotGenerat
 
 ### Core Components
 
-- **OpenShiftClient**: Executes `oc` commands, queries EIP and CPIC resources
+- **OpenShiftClient**: Executes `oc` commands, queries EIP and CPIC resources with caching
 - **AzureClient**: Executes `az` commands, queries NIC statistics
-- **EIPMonitor**: Main monitoring loop, collects and logs statistics
+- **EIPMonitor**: Main monitoring loop, collects and logs statistics with parallel processing
+- **SmartCache**: TTL-based caching with LRU eviction
+- **BufferedLogger**: Buffered file I/O for performance
 - **DataProcessor**: Merges log files into structured data files
-- **PlotGenerator**: Reads data files and generates time-series plots
-- **EIPToolkit**: CLI entry point with command routing
+- **PlotGenerator**: Reads data files (plotting requires external tools)
 
 ### Data Flow
 
@@ -102,21 +104,23 @@ EIPMonitor → Log Files → DataProcessor → Data Files (.dat) → PlotGenerat
 ```
 User
  │
- ├─> eip_toolkit.py monitor
+ ├─> ./eip-toolkit monitor
      │
-     └─> EIPMonitor.monitor_loop()
+     └─> EIPMonitor.MonitorLoop()
          │
-         ├─> OpenShiftClient.get_eip_stats()
+         ├─> OpenShiftClient.GetEIPStats()
          │   └─> oc get eip -o json
          │       └─> Parse JSON → EIPStats
          │
-         ├─> OpenShiftClient.get_cpic_stats()
+         ├─> OpenShiftClient.GetCPICStats()
          │   └─> oc get cloudprivateipconfig -o json
          │       └─> Parse JSON → CPICStats
          │
-         ├─> AzureClient.get_node_nic_stats()
-         │   └─> az network nic show
-         │       └─> Parse JSON → (ips, lbs)
+         ├─> CollectNodeDataParallel() (goroutines)
+         │   ├─> AzureClient.GetNodeNICStats()
+         │   │   └─> az network nic show
+         │   │       └─> Parse JSON → (ips, lbs)
+         │   └─> BufferedLogger.LogStats()
          │
          └─> Write to log files (logs/*.log)
              └─> Repeat every 1 second until complete
@@ -126,9 +130,9 @@ User
 ```
 User
  │
- ├─> eip_toolkit.py merge <directory>
+ ├─> ./eip-toolkit merge <directory>
      │
-     └─> DataProcessor.merge_logs()
+     └─> DataProcessor.MergeLogs()
          │
          ├─> Read log files (logs/*.log)
          │
@@ -143,47 +147,24 @@ User
 ```
 User
  │
- ├─> eip_toolkit.py plot <directory>
+ ├─> ./eip-toolkit plot <directory>
      │
-     └─> PlotGenerator.generate_all_plots()
+     └─> PlotGenerator.GenerateAllPlots()
          │
-         ├─> Read data files (data/*.dat)
-         │
-         ├─> Parse sections (node name, data lines)
-         │
-         ├─> Extract timestamps and values
-         │
-         └─> Generate matplotlib plots → PNG files (plots/*.png)
+         └─> Requires external plotting tools (gnuplot, matplotlib, etc.)
 ```
-
-#### Monitor Command
-1. Query OpenShift for EIP-enabled nodes via `oc get nodes`
-2. For each iteration:
-   - Query EIP resources: `oc get eip -o json`
-   - Query CPIC resources: `oc get cloudprivateipconfig -o json`
-   - Query Azure NIC stats: `az network nic show`
-   - Parse JSON responses and extract statistics
-   - Write timestamped values to log files
-3. Continue until `assigned == configured` and `cpic_success == configured`
-
-#### Merge Command
-1. Read log files from `logs/` directory
-2. Parse log entries (timestamp, value pairs)
-3. Group by metric type and node
-4. Write structured data to `.dat` files in `data/` directory
-5. Format: node name header followed by timestamp/value pairs
-
-#### Plot Command
-1. Read `.dat` files from `data/` directory
-2. Parse sections (node name, data lines)
-3. Extract timestamps and values per node
-4. Generate matplotlib plots with time-series data
-5. Save PNG files to `plots/` directory
 
 ### Monitoring Logic
 
 Monitoring loop continues while:
-- `eip_stats.assigned != eip_stats.configured` OR
-- `cpic_stats.success != eip_stats.configured`
+- `eipStats.Assigned != eipStats.Configured` OR
+- `cpicStats.Success != eipStats.Configured`
 
 Exits when both conditions are false (all EIPs assigned, all CPICs successful).
+
+### Go-Specific Features
+
+- **Goroutines**: Parallel node data collection using goroutines and semaphores
+- **SmartCache**: Thread-safe caching with TTL and LRU eviction
+- **BufferedLogger**: Concurrent-safe buffered file I/O
+- **Error Handling**: Custom error types with proper error wrapping

@@ -1,13 +1,14 @@
-# EIP Toolkit - Simple Version
+# EIP Toolkit - Simple Version (Go)
 
-Simplified version with core monitoring, logging, and visualization features.
+Simplified Go version with core monitoring, logging, and data processing features.
 
 ## Installation
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-pip install -r requirements_simple.txt
+go mod download
+make build-simple
+# Or manually:
+go build -o eip-toolkit-simple eip_toolkit_simple.go
 ```
 
 Set environment variables:
@@ -20,32 +21,32 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 
 ```bash
 # Monitor EIP and CPIC status
-python3 eip_toolkit_simple.py monitor
+./eip-toolkit-simple monitor
 
 # Merge log files into structured data
-python3 eip_toolkit_simple.py merge <directory>
+./eip-toolkit-simple merge <directory>
 
-# Generate plots from data files
-python3 eip_toolkit_simple.py plot <directory>
+# Generate plots from data files (placeholder - requires external tools)
+./eip-toolkit-simple plot <directory>
 
 # Complete pipeline
-python3 eip_toolkit_simple.py all
+./eip-toolkit-simple all
 ```
 
 ## Architecture
 
 ### Components
 
-- **EIPMonitor**: Single class containing all functionality
-  - `run_oc_command()`: Execute OpenShift CLI commands
-  - `run_az_command()`: Execute Azure CLI commands
-  - `get_eip_stats()`: Extract EIP statistics from JSON
-  - `get_cpic_stats()`: Extract CPIC statistics from JSON
-  - `get_nodes()`: Get list of EIP-enabled nodes
-  - `log_stats()`: Write timestamped statistics to log files
-  - `monitor()`: Main monitoring loop
-  - `merge_logs()`: Process log files into data files
-  - `create_plots()`: Generate plots from data files
+- **EIPMonitor**: Main struct with monitoring functionality
+  - `runOCCommand()`: Execute OpenShift CLI commands
+  - `runAZCommand()`: Execute Azure CLI commands
+  - `getEIPStats()`: Extract EIP statistics from JSON
+  - `getCPICStats()`: Extract CPIC statistics from JSON
+  - `getNodes()`: Get list of EIP-enabled nodes
+  - `logStats()`: Write timestamped statistics to log files
+  - `runMonitor()`: Main monitoring loop
+  - `runMergeLogs()`: Process log files into data files
+  - `runCreatePlots()`: Placeholder for plotting (requires external tools)
 
 ### Data Flow
 
@@ -65,7 +66,4 @@ python3 eip_toolkit_simple.py all
 
 #### Plot
 1. Read `.dat` files from `data/` directory
-2. Parse node sections and data lines
-3. Extract timestamps and values
-4. Generate matplotlib plots
-5. Save PNG files to `plots/` directory
+2. Placeholder - plotting requires external tools (gnuplot, matplotlib, etc.)
