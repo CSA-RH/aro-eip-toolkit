@@ -72,25 +72,28 @@ func NewSmartCache(defaultTTL time.Duration, maxSize int) *SmartCache {
 
 func (c *SmartCache) Get(key string) (interface{}, bool) {
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
 	entry, exists := c.cache[key]
 	if !exists {
+		c.mu.RUnlock()
 		return nil, false
 	}
 
 	now := time.Now()
-	if now.Sub(entry.timestamp) > entry.ttl {
-		c.mu.RUnlock()
+	isExpired := now.Sub(entry.timestamp) > entry.ttl
+	c.mu.RUnlock()
+
+	if isExpired {
 		c.mu.Lock()
 		delete(c.cache, key)
 		delete(c.accessTimes, key)
 		c.mu.Unlock()
-		c.mu.RLock()
 		return nil, false
 	}
 
+	// Update access time with write lock
+	c.mu.Lock()
 	c.accessTimes[key] = now
+	c.mu.Unlock()
 	return entry.data, true
 }
 
@@ -137,10 +140,10 @@ func (c *SmartCache) evictLRU() {
 
 // BufferedLogger provides buffered file I/O
 type BufferedLogger struct {
-	mu          sync.Mutex
-	logsDir     string
-	buffers     map[string][]string
-	bufferSize  int
+	mu         sync.Mutex
+	logsDir    string
+	buffers    map[string][]string
+	bufferSize int
 }
 
 func NewBufferedLogger(logsDir string, bufferSize int) *BufferedLogger {
@@ -617,7 +620,7 @@ func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CP
 }
 
 type NodeEIPData struct {
-	Node       string
+	Node        string
 	EIPAssigned int
 	AzureEIPs   int
 }
@@ -681,7 +684,7 @@ func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) 
 		wg.Add(1)
 		go func(n string) {
 			defer wg.Done()
-			sem <- struct{}{} // Acquire semaphore
+			sem <- struct{}{}        // Acquire semaphore
 			defer func() { <-sem }() // Release semaphore
 
 			data := em.CollectSingleNodeData(n, timestamp)
@@ -798,9 +801,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 // DataProcessor handles log merging
 type DataProcessor struct {
-	baseDir  string
-	logsDir  string
-	dataDir  string
+	baseDir string
+	logsDir string
+	dataDir string
 }
 
 func NewDataProcessor(baseDir string) *DataProcessor {
@@ -854,11 +857,11 @@ func (dp *DataProcessor) MergeLogs() error {
 	// Process each file type
 	fileMappings := map[string]string{
 		"ocp_cpic_success.log": "ocp_cpic_success.dat",
-		"ocp_cpic_pending.log":  "ocp_cpic_pending.dat",
-		"ocp_cpic_error.log":    "ocp_cpic_error.dat",
-		"ocp_eip_assigned.log":  "ocp_eip_assigned.dat",
-		"azure_eips.log":        "azure_eips.dat",
-		"azure_lbs.log":         "azure_lbs.dat",
+		"ocp_cpic_pending.log": "ocp_cpic_pending.dat",
+		"ocp_cpic_error.log":   "ocp_cpic_error.dat",
+		"ocp_eip_assigned.log": "ocp_eip_assigned.dat",
+		"azure_eips.log":       "azure_eips.dat",
+		"azure_lbs.log":        "azure_lbs.dat",
 	}
 
 	for logSuffix, datFilename := range fileMappings {
@@ -1147,4 +1150,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-
