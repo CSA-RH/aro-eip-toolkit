@@ -28,7 +28,7 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 # Process log files into structured data
 ./eip-toolkit merge <directory>
 
-# Generate plots from data files (requires external tools)
+# Generate plots from data files
 ./eip-toolkit plot <directory>
 
 # Complete pipeline: monitor → merge → plot
@@ -50,7 +50,7 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 ../runs/YYMMDD_HHMMSS/
 ├── logs/           # Raw timestamped log files
 ├── data/           # Processed .dat files
-└── plots/          # Generated PNG plots (requires external tools)
+└── plots/          # Generated PNG plots
 ```
 
 ## Architecture
@@ -96,7 +96,7 @@ EIPMonitor → Log Files → DataProcessor → Data Files (.dat) → PlotGenerat
 - **SmartCache**: TTL-based caching with LRU eviction
 - **BufferedLogger**: Buffered file I/O for performance
 - **DataProcessor**: Merges log files into structured data files
-- **PlotGenerator**: Reads data files (plotting requires external tools)
+- **PlotGenerator**: Reads data files and generates PNG plots using gonum/plot
 
 ### Data Flow
 
@@ -151,7 +151,11 @@ User
      │
      └─> PlotGenerator.GenerateAllPlots()
          │
-         └─> Requires external plotting tools (gnuplot, matplotlib, etc.)
+         ├─> Parse .dat files (node sections with timestamp/value pairs)
+         │
+         ├─> Generate time-series line plots per node
+         │
+         └─> Save PNG files (plots/*.png)
 ```
 
 ### Monitoring Logic

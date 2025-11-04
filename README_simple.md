@@ -26,7 +26,7 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 # Merge log files into structured data
 ./eip-toolkit-simple merge <directory>
 
-# Generate plots from data files (placeholder - requires external tools)
+# Generate plots from data files
 ./eip-toolkit-simple plot <directory>
 
 # Complete pipeline
@@ -46,7 +46,7 @@ export AZ_RESOURCE_GROUP="your-resource-group"
   - `logStats()`: Write timestamped statistics to log files
   - `runMonitor()`: Main monitoring loop
   - `runMergeLogs()`: Process log files into data files
-  - `runCreatePlots()`: Placeholder for plotting (requires external tools)
+  - `runCreatePlots()`: Generate PNG plots from data files
 
 ### Data Flow
 
@@ -66,4 +66,6 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 
 #### Plot
 1. Read `.dat` files from `data/` directory
-2. Placeholder - plotting requires external tools (gnuplot, matplotlib, etc.)
+2. Parse node sections with timestamp/value pairs
+3. Generate time-series line plots using gonum/plot
+4. Save PNG files to `plots/` directory

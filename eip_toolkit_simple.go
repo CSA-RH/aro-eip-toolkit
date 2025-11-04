@@ -1,17 +1,23 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
+	"gonum.org/v1/plot"
+	"gonum.org/v1/plot/plotter"
+	"gonum.org/v1/plot/vg"
 )
 
 var (
@@ -464,7 +470,165 @@ func runMergeLogs() error {
 	return nil
 }
 
-// createPlots generates plots from data files (placeholder - requires external plotting tool)
+// DataPoint represents a single data point with timestamp and value
+type DataPoint struct {
+	Time  time.Time
+	Value float64
+}
+
+// parseDataFile parses a .dat file and returns node data with timestamps and values
+func parseDataFile(filename string) (map[string][]DataPoint, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	nodeData := make(map[string][]DataPoint)
+	var currentNode string
+	var points []DataPoint
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" {
+			// Empty line separates nodes
+			if currentNode != "" && len(points) > 0 {
+				nodeData[currentNode] = points
+				points = []DataPoint{}
+			}
+			currentNode = ""
+			continue
+		}
+
+		// Check if line is a node name (in quotes)
+		if strings.HasPrefix(line, `"`) && strings.HasSuffix(line, `"`) {
+			// Save previous node's data
+			if currentNode != "" && len(points) > 0 {
+				nodeData[currentNode] = points
+			}
+			// Extract node name
+			currentNode = strings.Trim(line, `"`)
+			points = []DataPoint{}
+			continue
+		}
+
+		// Parse timestamp and value
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			// Parse timestamp (format: YYMMDD_HHMMSS)
+			timestampStr := parts[0]
+			valueStr := parts[1]
+
+			value, err := strconv.ParseFloat(valueStr, 64)
+			if err != nil {
+				continue // Skip invalid lines
+			}
+
+			// Parse timestamp
+			t, err := time.Parse("060102_150405", timestampStr)
+			if err != nil {
+				continue
+			}
+
+			points = append(points, DataPoint{
+				Time:  t,
+				Value: value,
+			})
+		}
+	}
+
+	// Save last node's data
+	if currentNode != "" && len(points) > 0 {
+		nodeData[currentNode] = points
+	}
+
+	return nodeData, scanner.Err()
+}
+
+// generatePlot creates a PNG plot from a data file
+func generatePlot(dataFile, plotPath, title string) error {
+	nodeData, err := parseDataFile(dataFile)
+	if err != nil {
+		return err
+	}
+
+	if len(nodeData) == 0 {
+		return fmt.Errorf("no data found in file")
+	}
+
+	p := plot.New()
+	p.Title.Text = title
+	p.X.Label.Text = "Time"
+	p.Y.Label.Text = "Value"
+	p.X.Tick.Marker = plot.TimeTicks{Format: "15:04:05"}
+	p.Legend.Top = true
+
+	// Color palette for different nodes
+	colors := []string{"blue", "red", "green", "orange", "purple", "brown", "pink", "gray"}
+
+	colorIdx := 0
+	for node, points := range nodeData {
+		if len(points) == 0 {
+			continue
+		}
+
+		// Convert to plotter.XYs
+		pts := make(plotter.XYs, len(points))
+		for i, point := range points {
+			pts[i].X = float64(point.Time.Unix())
+			pts[i].Y = point.Value
+		}
+
+		line, err := plotter.NewLine(pts)
+		if err != nil {
+			return err
+		}
+
+		colorName := colors[colorIdx%len(colors)]
+		line.Color = getColor(colorName)
+		line.Width = vg.Points(1.5)
+
+		p.Add(line)
+		p.Legend.Add(node, line)
+
+		colorIdx++
+	}
+
+	// Save plot
+	if err := p.Save(10*vg.Inch, 6*vg.Inch, plotPath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// getColor converts a color name to a color.Color
+func getColor(name string) color.Color {
+	switch strings.ToLower(name) {
+	case "blue":
+		return color.RGBA{R: 0, G: 0, B: 255, A: 255}
+	case "red":
+		return color.RGBA{R: 255, G: 0, B: 0, A: 255}
+	case "green":
+		return color.RGBA{R: 0, G: 255, B: 0, A: 255}
+	case "orange":
+		return color.RGBA{R: 255, G: 165, B: 0, A: 255}
+	case "purple":
+		return color.RGBA{R: 128, G: 0, B: 128, A: 255}
+	case "brown":
+		return color.RGBA{R: 165, G: 42, B: 42, A: 255}
+	case "pink":
+		return color.RGBA{R: 255, G: 192, B: 203, A: 255}
+	case "gray":
+		return color.RGBA{R: 128, G: 128, B: 128, A: 255}
+	default:
+		return color.RGBA{R: 0, G: 0, B: 0, A: 255}
+	}
+}
+
+// runCreatePlots generates plots from data files
 func runCreatePlots() error {
 	if err := setupDirectories(outputDir); err != nil {
 		return err
@@ -481,7 +645,21 @@ func runCreatePlots() error {
 		return &EIPToolkitError{Message: "No .dat files found for plotting"}
 	}
 
-	log.Printf("Found %d data files. Plotting requires external tools (gnuplot, matplotlib, etc.)", len(dataFiles))
+	log.Printf("Found %d data files. Generating plots...", len(dataFiles))
+
+	for _, dataFile := range dataFiles {
+		baseName := filepath.Base(dataFile)
+		plotName := strings.TrimSuffix(baseName, ".dat") + ".png"
+		plotPath := filepath.Join(plotsDir, plotName)
+
+		if err := generatePlot(dataFile, plotPath, baseName); err != nil {
+			log.Printf("Warning: Failed to generate plot for %s: %v", baseName, err)
+			continue
+		}
+
+		log.Printf("Generated plot: %s", plotPath)
+	}
+
 	log.Println("Plot generation completed")
 	return nil
 }
