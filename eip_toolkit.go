@@ -939,7 +939,7 @@ func (pg *PlotGenerator) parseDataFile(filename string) (map[string][]DataPoint,
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		
+
 		if line == "" {
 			// Empty line separates nodes
 			if currentNode != "" && len(points) > 0 {
@@ -968,7 +968,7 @@ func (pg *PlotGenerator) parseDataFile(filename string) (map[string][]DataPoint,
 			// Parse timestamp (format: YYMMDD_HHMMSS)
 			timestampStr := parts[0]
 			valueStr := parts[1]
-			
+
 			value, err := strconv.ParseFloat(valueStr, 64)
 			if err != nil {
 				continue // Skip invalid lines
