@@ -774,6 +774,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 	sort.Strings(nodes) // Ensure consistent ordering
 	log.Printf("Found EIP-enabled nodes: %v", nodes)
 
+	// Track number of lines we've printed (for overwriting)
+	linesPrinted := 0
+
 	for {
 		timestamp := time.Now().Format(time.RFC3339)
 
@@ -804,12 +807,25 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// Collect node data in parallel
 		nodeData := em.CollectNodeDataParallel(nodes, timestamp)
 
-		// Log node statistics in sorted order
+		// Move cursor up to overwrite previous lines (if any)
+		if linesPrinted > 0 {
+			fmt.Printf("\033[%dA", linesPrinted) // Move up N lines
+		}
+
+		// Print node statistics in sorted order (using \033[K to clear line)
 		for _, data := range nodeData {
-			log.Printf("%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d",
+			fmt.Printf("\033[K%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d\n",
 				data.Node, data.CPICSuccess, data.CPICPending, data.CPICError,
 				data.EIPAssigned, data.AzureEIPs, data.AzureLBs)
 		}
+
+		// Print summary stats
+		fmt.Printf("\033[KConfigured EIPs: %d\n", eipStats.Configured)
+		fmt.Printf("\033[KSuccessful CPICs: %d\n", cpicStats.Success)
+		fmt.Printf("\033[KAssigned EIPs: %d\n", eipStats.Assigned)
+
+		// Update count of lines printed (nodes + 3 summary lines)
+		linesPrinted = len(nodeData) + 3
 
 		// Log aggregated cluster-wide EIP summary
 		if err := em.LogClusterSummary(timestamp, nodeData); err != nil {
@@ -823,6 +839,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		// Check if monitoring should continue
 		if !em.ShouldContinueMonitoring(eipStats, cpicStats) {
+			fmt.Printf("\n") // Add final newline
 			break
 		}
 
