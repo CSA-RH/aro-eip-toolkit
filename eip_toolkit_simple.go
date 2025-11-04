@@ -225,6 +225,7 @@ func getNodes() ([]string, error) {
 		}
 	}
 
+	sort.Strings(nodes) // Ensure consistent ordering
 	return nodes, nil
 }
 
@@ -597,11 +598,18 @@ func generatePlot(dataFile, plotPath, title string) error {
 	// Color palette for different nodes
 	colors := []string{"blue", "red", "green", "orange", "purple", "brown", "pink", "gray"}
 
-	colorIdx := 0
-	for node, points := range nodeData {
-		if len(points) == 0 {
-			continue
+	// Sort nodes for consistent ordering
+	sortedNodes := make([]string, 0, len(nodeData))
+	for node := range nodeData {
+		if len(nodeData[node]) > 0 {
+			sortedNodes = append(sortedNodes, node)
 		}
+	}
+	sort.Strings(sortedNodes)
+
+	colorIdx := 0
+	for _, node := range sortedNodes {
+		points := nodeData[node]
 
 		// Convert to plotter.XYs
 		pts := make(plotter.XYs, len(points))

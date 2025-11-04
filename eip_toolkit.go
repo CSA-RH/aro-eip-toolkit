@@ -703,6 +703,12 @@ func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) 
 	}
 
 	wg.Wait()
+	
+	// Sort results by node name for consistent ordering
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Node < results[j].Node
+	})
+	
 	return results
 }
 
@@ -736,7 +742,15 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 	defer f.Close()
 
 	fmt.Fprintf(f, "%s CLUSTER_SUMMARY\n", timestamp)
-	for _, data := range nodeData {
+	
+	// Sort node data for consistent ordering
+	sortedNodeData := make([]*NodeEIPData, len(nodeData))
+	copy(sortedNodeData, nodeData)
+	sort.Slice(sortedNodeData, func(i, j int) bool {
+		return sortedNodeData[i].Node < sortedNodeData[j].Node
+	})
+	
+	for _, data := range sortedNodeData {
 		fmt.Fprintf(f, "%s %s %d %d\n", timestamp, data.Node, data.EIPAssigned, data.AzureEIPs)
 	}
 	fmt.Fprintf(f, "%s TOTAL %d %d\n\n", timestamp, totalAssignedEIPs, totalAzureEIPs)
@@ -751,6 +765,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 	if err != nil {
 		return err
 	}
+	sort.Strings(nodes) // Ensure consistent ordering
 	log.Printf("Found EIP-enabled nodes: %v", nodes)
 
 	for {
@@ -1067,11 +1082,18 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 	// Color palette for different nodes
 	colors := []string{"blue", "red", "green", "orange", "purple", "brown", "pink", "gray"}
 
-	colorIdx := 0
-	for node, points := range nodeData {
-		if len(points) == 0 {
-			continue
+	// Sort nodes for consistent ordering
+	sortedNodes := make([]string, 0, len(nodeData))
+	for node := range nodeData {
+		if len(nodeData[node]) > 0 {
+			sortedNodes = append(sortedNodes, node)
 		}
+	}
+	sort.Strings(sortedNodes)
+
+	colorIdx := 0
+	for _, node := range sortedNodes {
+		points := nodeData[node]
 
 		// Convert to plotter.XYs
 		pts := make(plotter.XYs, len(points))
