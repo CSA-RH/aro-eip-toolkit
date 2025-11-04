@@ -1283,7 +1283,8 @@ func cmdMonitor() error {
 	timestamp := time.Now().Format("060102_150405")
 	var outputDir string
 	if outputDirVar != "" {
-		outputDir = outputDirVar
+		// Append timestamped directory to user-specified path
+		outputDir = filepath.Join(outputDirVar, timestamp)
 	} else {
 		// Create run directory in temp directory
 		tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
@@ -1354,7 +1355,8 @@ func cmdAll() error {
 	timestamp := time.Now().Format("060102_150405")
 	var outputDir string
 	if outputDirVar != "" {
-		outputDir = outputDirVar
+		// Append timestamped directory to user-specified path
+		outputDir = filepath.Join(outputDirVar, timestamp)
 	} else {
 		// Create run directory in temp directory
 		tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
@@ -1413,6 +1415,7 @@ func main() {
 			return cmdMonitor()
 		},
 	}
+	monitorCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 
 	var mergeCmd = &cobra.Command{
 		Use:   "merge [directory]",
@@ -1439,6 +1442,7 @@ func main() {
 			return cmdAll()
 		},
 	}
+	allCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 
 	var monitorAsyncCmd = &cobra.Command{
 		Use:   "monitor-async",
@@ -1448,6 +1452,7 @@ func main() {
 			return cmdMonitor()
 		},
 	}
+	monitorAsyncCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 
 	var mergeOptimizedCmd = &cobra.Command{
 		Use:   "merge-optimized [directory]",
@@ -1466,6 +1471,7 @@ func main() {
 			return cmdAll()
 		},
 	}
+	allOptimizedCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 
 	rootCmd.AddCommand(monitorCmd, mergeCmd, plotCmd, allCmd, monitorAsyncCmd, mergeOptimizedCmd, allOptimizedCmd)
 

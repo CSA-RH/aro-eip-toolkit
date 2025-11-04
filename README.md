@@ -25,6 +25,10 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 # Monitor EIP and CPIC status
 ./eip-toolkit monitor
 
+# Monitor with custom output directory
+./eip-toolkit monitor --output-dir /path/to/output
+./eip-toolkit monitor -o /path/to/output
+
 # Process log files into structured data
 ./eip-toolkit merge <directory>
 
@@ -33,6 +37,9 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 
 # Complete pipeline: monitor → merge → plot
 ./eip-toolkit all
+
+# Complete pipeline with custom output directory
+./eip-toolkit all --output-dir /path/to/output
 
 # Async monitoring (parallel processing via goroutines)
 ./eip-toolkit monitor-async
@@ -54,7 +61,15 @@ ${TMPDIR}/eip-toolkit/YYMMDD_HHMMSS/
 └── plots/          # Generated PNG plots
 ```
 
-You can specify a custom output directory using the `--output-dir` flag (if supported) or by setting the `outputDirVar` variable in the code.
+You can specify a custom output base directory using the `--output-dir` (or `-o`) flag. The timestamped directory (YYMMDD_HHMMSS) will be automatically appended:
+
+```bash
+./eip-toolkit monitor --output-dir /path/to/output
+# Creates: /path/to/output/YYMMDD_HHMMSS/
+
+./eip-toolkit all -o /path/to/output
+# Creates: /path/to/output/YYMMDD_HHMMSS/
+```
 
 The output directory location is printed at the start of monitoring.
 
