@@ -1152,6 +1152,26 @@ func cmdMonitor() error {
 		return err
 	}
 
+	// Check if monitoring is needed BEFORE creating directories
+	ocClient := NewOpenShiftClient()
+	eipStats, err := ocClient.GetEIPStats()
+	if err != nil {
+		return err
+	}
+
+	cpicStats, err := ocClient.GetCPICStats()
+	if err != nil {
+		return err
+	}
+
+	// Create a temporary monitor just for the check
+	tempMonitor := &EIPMonitor{ocClient: ocClient}
+	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats) {
+		log.Println("No monitoring needed - all EIPs properly configured")
+		return nil
+	}
+
+	// Only create directories if monitoring is actually needed
 	timestamp := time.Now().Format("060102_150405")
 	outputDir := filepath.Join("..", "runs", timestamp)
 	if outputDirVar != "" {
@@ -1161,22 +1181,6 @@ func cmdMonitor() error {
 	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
 	if err != nil {
 		return err
-	}
-
-	// Check if monitoring is needed
-	eipStats, err := monitor.ocClient.GetEIPStats()
-	if err != nil {
-		return err
-	}
-
-	cpicStats, err := monitor.ocClient.GetCPICStats()
-	if err != nil {
-		return err
-	}
-
-	if !monitor.ShouldContinueMonitoring(eipStats, cpicStats) {
-		log.Println("No monitoring needed - all EIPs properly configured")
-		return nil
 	}
 
 	return monitor.MonitorLoop()
@@ -1210,28 +1214,33 @@ func cmdAll() error {
 
 	// Phase 1: Monitor
 	log.Println("📊 Phase 1: Starting EIP Monitoring...")
+
+	// Check if monitoring is needed BEFORE creating directories
+	ocClient := NewOpenShiftClient()
+	eipStats, err := ocClient.GetEIPStats()
+	if err != nil {
+		return err
+	}
+
+	cpicStats, err := ocClient.GetCPICStats()
+	if err != nil {
+		return err
+	}
+
+	// Create a temporary monitor just for the check
+	tempMonitor := &EIPMonitor{ocClient: ocClient}
+	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats) {
+		log.Println("No monitoring needed - pipeline complete")
+		return nil
+	}
+
+	// Only create directories if monitoring is actually needed
 	timestamp := time.Now().Format("060102_150405")
 	outputDir := filepath.Join("..", "runs", timestamp)
 
 	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
 	if err != nil {
 		return err
-	}
-
-	// Check if monitoring is needed
-	eipStats, err := monitor.ocClient.GetEIPStats()
-	if err != nil {
-		return err
-	}
-
-	cpicStats, err := monitor.ocClient.GetCPICStats()
-	if err != nil {
-		return err
-	}
-
-	if !monitor.ShouldContinueMonitoring(eipStats, cpicStats) {
-		log.Println("No monitoring needed - pipeline complete")
-		return nil
 	}
 
 	if err := monitor.MonitorLoop(); err != nil {

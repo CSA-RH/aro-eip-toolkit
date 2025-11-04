@@ -244,11 +244,29 @@ func logStats(timestamp, statsType string, stats map[string]int) error {
 
 // runMonitor runs the main monitoring loop
 func runMonitor() error {
-	if err := setupDirectories(outputDir); err != nil {
+	log.Println("Starting EIP monitoring...")
+
+	// Check if monitoring is needed BEFORE creating directories
+	eipStats, err := getEIPStats()
+	if err != nil {
 		return err
 	}
 
-	log.Println("Starting EIP monitoring...")
+	cpicStats, err := getCPICStats()
+	if err != nil {
+		return err
+	}
+
+	// Check if monitoring is needed
+	if eipStats["assigned"] == eipStats["configured"] && cpicStats["success"] == eipStats["configured"] {
+		log.Println("No monitoring needed - all EIPs properly configured")
+		return nil
+	}
+
+	// Only create directories if monitoring is actually needed
+	if err := setupDirectories(outputDir); err != nil {
+		return err
+	}
 
 	nodes, err := getNodes()
 	if err != nil {
