@@ -46,12 +46,17 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 
 ### Output Structure
 
+By default, output is created in the system's temporary directory:
 ```
-../runs/YYMMDD_HHMMSS/
+${TMPDIR}/eip-toolkit/YYMMDD_HHMMSS/
 ├── logs/           # Raw timestamped log files
 ├── data/           # Processed .dat files
 └── plots/          # Generated PNG plots
 ```
+
+You can specify a custom output directory using the `--output-dir` flag (if supported) or by setting the `outputDirVar` variable in the code.
+
+The output directory location is printed at the start of monitoring.
 
 ## Architecture
 

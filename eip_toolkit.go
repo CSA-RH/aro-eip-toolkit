@@ -1281,9 +1281,16 @@ func cmdMonitor() error {
 
 	// Only create directories if monitoring is actually needed
 	timestamp := time.Now().Format("060102_150405")
-	outputDir := filepath.Join("..", "runs", timestamp)
+	var outputDir string
 	if outputDirVar != "" {
 		outputDir = outputDirVar
+	} else {
+		// Create run directory in temp directory
+		tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
+		if err := os.MkdirAll(tempBase, 0755); err != nil {
+			return fmt.Errorf("failed to create temp base directory: %w", err)
+		}
+		outputDir = filepath.Join(tempBase, timestamp)
 	}
 
 	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
@@ -1291,6 +1298,7 @@ func cmdMonitor() error {
 		return err
 	}
 
+	log.Printf("Output directory: %s", outputDir)
 	return monitor.MonitorLoop()
 }
 
@@ -1344,13 +1352,24 @@ func cmdAll() error {
 
 	// Only create directories if monitoring is actually needed
 	timestamp := time.Now().Format("060102_150405")
-	outputDir := filepath.Join("..", "runs", timestamp)
+	var outputDir string
+	if outputDirVar != "" {
+		outputDir = outputDirVar
+	} else {
+		// Create run directory in temp directory
+		tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
+		if err := os.MkdirAll(tempBase, 0755); err != nil {
+			return fmt.Errorf("failed to create temp base directory: %w", err)
+		}
+		outputDir = filepath.Join(tempBase, timestamp)
+	}
 
 	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
 	if err != nil {
 		return err
 	}
 
+	log.Printf("Output directory: %s", outputDir)
 	if err := monitor.MonitorLoop(); err != nil {
 		return err
 	}
