@@ -420,9 +420,9 @@ func runMergeLogs() error {
 	// Process each file type
 	fileMappings := map[string]string{
 		"ocp_cpic_success.log": "ocp_cpic_success.dat",
-		"ocp_cpic_pending.log":  "ocp_cpic_pending.dat",
-		"ocp_cpic_error.log":    "ocp_cpic_error.dat",
-		"ocp_eip_assigned.log":  "ocp_eip_assigned.dat",
+		"ocp_cpic_pending.log": "ocp_cpic_pending.dat",
+		"ocp_cpic_error.log":   "ocp_cpic_error.dat",
+		"ocp_eip_assigned.log": "ocp_eip_assigned.dat",
 	}
 
 	for logSuffix, datFilename := range fileMappings {
@@ -569,4 +569,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-

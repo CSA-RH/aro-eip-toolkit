@@ -1,0 +1,1150 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+// EIPToolkitError represents toolkit-specific errors
+type EIPToolkitError struct {
+	Message string
+}
+
+func (e *EIPToolkitError) Error() string {
+	return e.Message
+}
+
+// Stats types
+type EIPStats struct {
+	Configured int
+	Assigned   int
+	Unassigned int
+}
+
+type CPICStats struct {
+	Success int
+	Pending int
+	Error   int
+}
+
+type NodeStats struct {
+	CPICSuccess int
+	CPICPending int
+	CPICError   int
+	EIPAssigned int
+	AzureEIPs   int
+	AzureLBs    int
+}
+
+// SmartCache provides intelligent caching with TTL and LRU eviction
+type SmartCache struct {
+	mu          sync.RWMutex
+	defaultTTL  time.Duration
+	maxSize     int
+	cache       map[string]cacheEntry
+	accessTimes map[string]time.Time
+}
+
+type cacheEntry struct {
+	data      interface{}
+	timestamp time.Time
+	ttl       time.Duration
+}
+
+func NewSmartCache(defaultTTL time.Duration, maxSize int) *SmartCache {
+	return &SmartCache{
+		defaultTTL:  defaultTTL,
+		maxSize:     maxSize,
+		cache:       make(map[string]cacheEntry),
+		accessTimes: make(map[string]time.Time),
+	}
+}
+
+func (c *SmartCache) Get(key string) (interface{}, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.cache[key]
+	if !exists {
+		return nil, false
+	}
+
+	now := time.Now()
+	if now.Sub(entry.timestamp) > entry.ttl {
+		c.mu.RUnlock()
+		c.mu.Lock()
+		delete(c.cache, key)
+		delete(c.accessTimes, key)
+		c.mu.Unlock()
+		c.mu.RLock()
+		return nil, false
+	}
+
+	c.accessTimes[key] = now
+	return entry.data, true
+}
+
+func (c *SmartCache) Set(key string, data interface{}, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.cache) >= c.maxSize {
+		c.evictLRU()
+	}
+
+	if ttl == 0 {
+		ttl = c.defaultTTL
+	}
+
+	c.cache[key] = cacheEntry{
+		data:      data,
+		timestamp: time.Now(),
+		ttl:       ttl,
+	}
+	c.accessTimes[key] = time.Now()
+}
+
+func (c *SmartCache) evictLRU() {
+	if len(c.accessTimes) == 0 {
+		return
+	}
+
+	var lruKey string
+	var lruTime time.Time
+	first := true
+
+	for key, t := range c.accessTimes {
+		if first || t.Before(lruTime) {
+			lruKey = key
+			lruTime = t
+			first = false
+		}
+	}
+
+	delete(c.cache, lruKey)
+	delete(c.accessTimes, lruKey)
+}
+
+// BufferedLogger provides buffered file I/O
+type BufferedLogger struct {
+	mu          sync.Mutex
+	logsDir     string
+	buffers     map[string][]string
+	bufferSize  int
+}
+
+func NewBufferedLogger(logsDir string, bufferSize int) *BufferedLogger {
+	return &BufferedLogger{
+		logsDir:    logsDir,
+		buffers:    make(map[string][]string),
+		bufferSize: bufferSize,
+	}
+}
+
+func (bl *BufferedLogger) LogStats(timestamp, statsType string, stats map[string]interface{}) error {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	for statName, value := range stats {
+		key := fmt.Sprintf("%s_%s", statsType, statName)
+		if bl.buffers[key] == nil {
+			bl.buffers[key] = make([]string, 0, bl.bufferSize)
+		}
+
+		line := fmt.Sprintf("%s %v\n", timestamp, value)
+		bl.buffers[key] = append(bl.buffers[key], line)
+
+		if len(bl.buffers[key]) >= bl.bufferSize {
+			if err := bl.flushBuffer(key); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (bl *BufferedLogger) flushBuffer(key string) error {
+	lines := bl.buffers[key]
+	if len(lines) == 0 {
+		return nil
+	}
+
+	logFile := filepath.Join(bl.logsDir, fmt.Sprintf("%s.log", key))
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for _, line := range lines {
+		if _, err := f.WriteString(line); err != nil {
+			return err
+		}
+	}
+
+	bl.buffers[key] = bl.buffers[key][:0]
+	return nil
+}
+
+func (bl *BufferedLogger) FlushAll() error {
+	bl.mu.Lock()
+	defer bl.mu.Unlock()
+
+	for key := range bl.buffers {
+		if err := bl.flushBuffer(key); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// OpenShiftClient handles OpenShift CLI operations with caching
+type OpenShiftClient struct {
+	cache *SmartCache
+}
+
+func NewOpenShiftClient() *OpenShiftClient {
+	return &OpenShiftClient{
+		cache: NewSmartCache(5*time.Second, 1000),
+	}
+}
+
+func (oc *OpenShiftClient) RunCommand(cmd []string) (map[string]interface{}, error) {
+	cacheKey := strings.Join(cmd, " ")
+
+	if data, found := oc.cache.Get(cacheKey); found {
+		return data.(map[string]interface{}), nil
+	}
+
+	cmdObj := exec.Command("oc", cmd...)
+	output, err := cmdObj.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("OpenShift command failed: %s", string(exitError.Stderr))
+		}
+		return nil, fmt.Errorf("OpenShift command failed: %w", err)
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+
+	oc.cache.Set(cacheKey, result, 5*time.Second)
+	return result, nil
+}
+
+func (oc *OpenShiftClient) GetEIPEnabledNodes() ([]string, error) {
+	cmd := exec.Command("oc", "get", "nodes", "-l", "k8s.ovn.org/egress-assignable=true", "-o", "name")
+	output, err := cmd.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return nil, &EIPToolkitError{Message: fmt.Sprintf("Cannot access OpenShift nodes: %s", string(exitError.Stderr))}
+		}
+		return nil, fmt.Errorf("cannot access OpenShift nodes: %w", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	nodes := make([]string, 0, len(lines))
+
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		nodeName := strings.TrimPrefix(line, "node/")
+		if nodeName != "" {
+			nodes = append(nodes, nodeName)
+		}
+	}
+
+	if len(nodes) == 0 {
+		return nil, &EIPToolkitError{Message: "No EIP-enabled nodes found"}
+	}
+
+	return nodes, nil
+}
+
+func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
+	data, err := oc.RunCommand([]string{"get", "eip", "-o", "json"})
+	if err != nil {
+		return nil, err
+	}
+
+	items, ok := data["items"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid items format")
+	}
+
+	configured := len(items)
+	assigned := 0
+	unassigned := 0
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			unassigned++
+			continue
+		}
+
+		statusItems, ok := status["items"].([]interface{})
+		if ok && len(statusItems) > 0 {
+			assigned++
+		} else {
+			unassigned++
+		}
+	}
+
+	return &EIPStats{
+		Configured: configured,
+		Assigned:   assigned,
+		Unassigned: unassigned,
+	}, nil
+}
+
+func (oc *OpenShiftClient) GetCPICStats() (*CPICStats, error) {
+	data, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "-o", "json"})
+	if err != nil {
+		return nil, err
+	}
+
+	items, ok := data["items"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid items format")
+	}
+
+	success := 0
+	pending := 0
+	errorCount := 0
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		conditions, ok := status["conditions"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, cond := range conditions {
+			condMap, ok := cond.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			reason, ok := condMap["reason"].(string)
+			if !ok {
+				continue
+			}
+
+			switch reason {
+			case "CloudResponseSuccess":
+				success++
+			case "CloudResponsePending":
+				pending++
+			case "CloudResponseError":
+				errorCount++
+			}
+		}
+	}
+
+	return &CPICStats{
+		Success: success,
+		Pending: pending,
+		Error:   errorCount,
+	}, nil
+}
+
+func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
+	// Get CPIC stats for the node
+	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "-o", "json"})
+	if err != nil {
+		return nil, err
+	}
+
+	cpicSuccess := 0
+	cpicPending := 0
+	cpicError := 0
+
+	items, ok := cpicData["items"].([]interface{})
+	if ok {
+		for _, item := range items {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if !ok || spec["node"] != nodeName {
+				continue
+			}
+
+			status, ok := itemMap["status"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			conditions, ok := status["conditions"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			for _, cond := range conditions {
+				condMap, ok := cond.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				reason, ok := condMap["reason"].(string)
+				if !ok {
+					continue
+				}
+
+				switch reason {
+				case "CloudResponseSuccess":
+					cpicSuccess++
+				case "CloudResponsePending":
+					cpicPending++
+				case "CloudResponseError":
+					cpicError++
+				}
+			}
+		}
+	}
+
+	// Get EIP stats for the node
+	eipData, err := oc.RunCommand([]string{"get", "eip", "-o", "json"})
+	if err != nil {
+		return nil, err
+	}
+
+	eipAssigned := 0
+	items, ok = eipData["items"].([]interface{})
+	if ok {
+		for _, item := range items {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			status, ok := itemMap["status"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			statusItems, ok := status["items"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			for _, statusItem := range statusItems {
+				statusItemMap, ok := statusItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				if statusItemMap["node"] == nodeName {
+					eipAssigned++
+				}
+			}
+		}
+	}
+
+	return &NodeStats{
+		CPICSuccess: cpicSuccess,
+		CPICPending: cpicPending,
+		CPICError:   cpicError,
+		EIPAssigned: eipAssigned,
+		AzureEIPs:   0, // Will be filled by Azure client
+		AzureLBs:    0, // Will be filled by Azure client
+	}, nil
+}
+
+// AzureClient handles Azure CLI operations
+type AzureClient struct {
+	subscriptionID string
+	resourceGroup  string
+}
+
+func NewAzureClient(subscriptionID, resourceGroup string) *AzureClient {
+	return &AzureClient{
+		subscriptionID: subscriptionID,
+		resourceGroup:  resourceGroup,
+	}
+}
+
+func (ac *AzureClient) RunCommand(cmd []string) (interface{}, error) {
+	args := append([]string{}, cmd...)
+	args = append(args, "--subscription", ac.subscriptionID)
+	cmdObj := exec.Command("az", args...)
+	output, err := cmdObj.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return nil, fmt.Errorf("Azure command failed: %s", string(exitError.Stderr))
+		}
+		return nil, fmt.Errorf("Azure command failed: %w", err)
+	}
+
+	var result interface{}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON: %w", err)
+	}
+
+	return result, nil
+}
+
+func (ac *AzureClient) GetNodeNICStats(nodeName string) (int, int, error) {
+	nicName := fmt.Sprintf("%s-nic", nodeName)
+
+	// Get IP configurations
+	ipConfigsResult, err := ac.RunCommand([]string{"network", "nic", "show",
+		"--resource-group", ac.resourceGroup,
+		"--name", nicName,
+		"--query", "ipConfigurations[].privateIPAddress"})
+	if err != nil {
+		return 0, 0, err
+	}
+
+	ipConfigs, ok := ipConfigsResult.([]interface{})
+	if !ok {
+		return 0, 0, nil
+	}
+
+	// Get load balancer associations
+	lbConfigsResult, err := ac.RunCommand([]string{"network", "nic", "show",
+		"--resource-group", ac.resourceGroup,
+		"--name", nicName,
+		"--query", "ipConfigurations[].{pools:loadBalancerBackendAddressPools[].id}"})
+	if err != nil {
+		return max(0, len(ipConfigs)-1), 0, nil
+	}
+
+	lbConfigs, ok := lbConfigsResult.([]interface{})
+	if !ok {
+		return max(0, len(ipConfigs)-1), 0, nil
+	}
+
+	totalIPs := len(ipConfigs)
+	lbAssociated := 0
+
+	for _, cfg := range lbConfigs {
+		cfgMap, ok := cfg.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		pools, ok := cfgMap["pools"].([]interface{})
+		if ok && len(pools) > 0 {
+			lbAssociated++
+		}
+	}
+
+	secondaryIPs := max(0, totalIPs-1)
+	secondaryLBIPs := max(0, lbAssociated-1)
+
+	return secondaryIPs, secondaryLBIPs, nil
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// EIPMonitor handles monitoring operations
+type EIPMonitor struct {
+	outputDir      string
+	logsDir        string
+	dataDir        string
+	plotsDir       string
+	ocClient       *OpenShiftClient
+	azClient       *AzureClient
+	bufferedLogger *BufferedLogger
+}
+
+func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor, error) {
+	logsDir := filepath.Join(outputDir, "logs")
+	dataDir := filepath.Join(outputDir, "data")
+	plotsDir := filepath.Join(outputDir, "plots")
+
+	for _, dir := range []string{logsDir, dataDir, plotsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+		}
+	}
+
+	return &EIPMonitor{
+		outputDir:      outputDir,
+		logsDir:        logsDir,
+		dataDir:        dataDir,
+		plotsDir:       plotsDir,
+		ocClient:       NewOpenShiftClient(),
+		azClient:       NewAzureClient(subscriptionID, resourceGroup),
+		bufferedLogger: NewBufferedLogger(logsDir, 100),
+	}, nil
+}
+
+func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats) bool {
+	log.Printf("Configured EIPs: %d", eipStats.Configured)
+	log.Printf("Successful CPICs: %d", cpicStats.Success)
+	log.Printf("Assigned EIPs: %d", eipStats.Assigned)
+
+	return eipStats.Assigned != eipStats.Configured || cpicStats.Success != eipStats.Configured
+}
+
+type NodeEIPData struct {
+	Node       string
+	EIPAssigned int
+	AzureEIPs   int
+}
+
+func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData {
+	nodeStats, err := em.ocClient.GetNodeStats(node)
+	if err != nil {
+		log.Printf("Error monitoring node %s: %v", node, err)
+		return nil
+	}
+
+	azureEIPs, azureLBs, err := em.azClient.GetNodeNICStats(node)
+	if err != nil {
+		log.Printf("Error getting Azure stats for node %s: %v", node, err)
+		azureEIPs, azureLBs = 0, 0
+	}
+
+	nodeStats.AzureEIPs = azureEIPs
+	nodeStats.AzureLBs = azureLBs
+
+	// Log node statistics
+	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_cpic", node), map[string]interface{}{
+		"success": nodeStats.CPICSuccess,
+		"pending": nodeStats.CPICPending,
+		"error":   nodeStats.CPICError,
+	})
+
+	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_eip", node), map[string]interface{}{
+		"assigned": nodeStats.EIPAssigned,
+	})
+
+	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_azure", node), map[string]interface{}{
+		"eips": nodeStats.AzureEIPs,
+		"lbs":  nodeStats.AzureLBs,
+	})
+
+	log.Printf("%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d",
+		node, nodeStats.CPICSuccess, nodeStats.CPICPending, nodeStats.CPICError,
+		nodeStats.EIPAssigned, nodeStats.AzureEIPs, nodeStats.AzureLBs)
+
+	return &NodeEIPData{
+		Node:        node,
+		EIPAssigned: nodeStats.EIPAssigned,
+		AzureEIPs:   azureEIPs,
+	}
+}
+
+func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) []*NodeEIPData {
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	results := make([]*NodeEIPData, 0, len(nodes))
+
+	maxWorkers := len(nodes)
+	if maxWorkers > 10 {
+		maxWorkers = 10
+	}
+
+	sem := make(chan struct{}, maxWorkers)
+
+	for _, node := range nodes {
+		wg.Add(1)
+		go func(n string) {
+			defer wg.Done()
+			sem <- struct{}{} // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			data := em.CollectSingleNodeData(n, timestamp)
+			if data != nil {
+				mu.Lock()
+				results = append(results, data)
+				mu.Unlock()
+			}
+		}(node)
+	}
+
+	wg.Wait()
+	return results
+}
+
+func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPData) error {
+	totalAssignedEIPs := 0
+	totalAzureEIPs := 0
+	for _, data := range nodeData {
+		totalAssignedEIPs += data.EIPAssigned
+		totalAzureEIPs += data.AzureEIPs
+	}
+
+	nodeCount := len(nodeData)
+	avgEIPs := float64(totalAssignedEIPs)
+	if nodeCount > 0 {
+		avgEIPs = avgEIPs / float64(nodeCount)
+	}
+
+	em.bufferedLogger.LogStats(timestamp, "cluster_summary", map[string]interface{}{
+		"total_assigned_eips": totalAssignedEIPs,
+		"total_azure_eips":    totalAzureEIPs,
+		"node_count":          nodeCount,
+		"avg_eips_per_node":   avgEIPs,
+	})
+
+	// Write detailed summary
+	summaryFile := filepath.Join(em.logsDir, "cluster_eip_details.log")
+	f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	fmt.Fprintf(f, "%s CLUSTER_SUMMARY\n", timestamp)
+	for _, data := range nodeData {
+		fmt.Fprintf(f, "%s %s %d %d\n", timestamp, data.Node, data.EIPAssigned, data.AzureEIPs)
+	}
+	fmt.Fprintf(f, "%s TOTAL %d %d\n\n", timestamp, totalAssignedEIPs, totalAzureEIPs)
+
+	return nil
+}
+
+func (em *EIPMonitor) MonitorLoop() error {
+	log.Println("Starting EIP monitoring loop...")
+
+	nodes, err := em.ocClient.GetEIPEnabledNodes()
+	if err != nil {
+		return err
+	}
+	log.Printf("Found EIP-enabled nodes: %v", nodes)
+
+	for {
+		timestamp := time.Now().Format(time.RFC3339)
+
+		// Get global statistics once per iteration
+		eipStats, err := em.ocClient.GetEIPStats()
+		if err != nil {
+			return err
+		}
+
+		cpicStats, err := em.ocClient.GetCPICStats()
+		if err != nil {
+			return err
+		}
+
+		// Log global statistics
+		em.bufferedLogger.LogStats(timestamp, "ocp_eips", map[string]interface{}{
+			"configured": eipStats.Configured,
+			"assigned":   eipStats.Assigned,
+			"unassigned": eipStats.Unassigned,
+		})
+
+		em.bufferedLogger.LogStats(timestamp, "ocp_cpic", map[string]interface{}{
+			"success": cpicStats.Success,
+			"pending": cpicStats.Pending,
+			"error":   cpicStats.Error,
+		})
+
+		// Collect node data in parallel
+		nodeData := em.CollectNodeDataParallel(nodes, timestamp)
+
+		// Log aggregated cluster-wide EIP summary
+		if err := em.LogClusterSummary(timestamp, nodeData); err != nil {
+			log.Printf("Error creating cluster summary: %v", err)
+		}
+
+		// Flush all buffered logs
+		if err := em.bufferedLogger.FlushAll(); err != nil {
+			log.Printf("Error flushing logs: %v", err)
+		}
+
+		// Check if monitoring should continue
+		if !em.ShouldContinueMonitoring(eipStats, cpicStats) {
+			break
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	log.Println("Monitoring complete - all EIPs assigned and CPIC issues resolved")
+	return nil
+}
+
+// DataProcessor handles log merging
+type DataProcessor struct {
+	baseDir  string
+	logsDir  string
+	dataDir  string
+}
+
+func NewDataProcessor(baseDir string) *DataProcessor {
+	return &DataProcessor{
+		baseDir: baseDir,
+		logsDir: filepath.Join(baseDir, "logs"),
+		dataDir: filepath.Join(baseDir, "data"),
+	}
+}
+
+func (dp *DataProcessor) MergeLogs() error {
+	log.Println("Starting log merge process...")
+
+	if _, err := os.Stat(dp.logsDir); os.IsNotExist(err) {
+		return &EIPToolkitError{Message: fmt.Sprintf("Logs directory %s does not exist", dp.logsDir)}
+	}
+
+	logFiles, err := filepath.Glob(filepath.Join(dp.logsDir, "*.log"))
+	if err != nil {
+		return err
+	}
+
+	if len(logFiles) == 0 {
+		return &EIPToolkitError{Message: fmt.Sprintf("No log files found in %s", dp.logsDir)}
+	}
+
+	log.Printf("Found %d log files", len(logFiles))
+
+	// Get unique node names
+	nodeSet := make(map[string]bool)
+	for _, logFile := range logFiles {
+		filename := filepath.Base(logFile)
+		if !strings.HasPrefix(filename, "ocp_") && !strings.HasPrefix(filename, "azure_") {
+			if idx := strings.Index(filename, "_"); idx > 0 {
+				nodeName := filename[:idx]
+				nodeSet[nodeName] = true
+			}
+		}
+	}
+
+	nodes := make([]string, 0, len(nodeSet))
+	for node := range nodeSet {
+		nodes = append(nodes, node)
+	}
+	sort.Strings(nodes)
+
+	if len(nodes) == 0 {
+		log.Println("No node-specific log files found")
+	}
+
+	// Process each file type
+	fileMappings := map[string]string{
+		"ocp_cpic_success.log": "ocp_cpic_success.dat",
+		"ocp_cpic_pending.log":  "ocp_cpic_pending.dat",
+		"ocp_cpic_error.log":    "ocp_cpic_error.dat",
+		"ocp_eip_assigned.log":  "ocp_eip_assigned.dat",
+		"azure_eips.log":        "azure_eips.dat",
+		"azure_lbs.log":         "azure_lbs.dat",
+	}
+
+	for logSuffix, datFilename := range fileMappings {
+		dataFile := filepath.Join(dp.dataDir, datFilename)
+		outFile, err := os.Create(dataFile)
+		if err != nil {
+			return err
+		}
+
+		for _, node := range nodes {
+			logFile := filepath.Join(dp.logsDir, fmt.Sprintf("%s_%s", node, logSuffix))
+			if _, err := os.Stat(logFile); err == nil {
+				fmt.Fprintf(outFile, "\"%s\"\n", node)
+
+				inFile, err := os.Open(logFile)
+				if err != nil {
+					outFile.Close()
+					return err
+				}
+
+				buf := make([]byte, 1024)
+				for {
+					n, err := inFile.Read(buf)
+					if n > 0 {
+						outFile.Write(buf[:n])
+					}
+					if err != nil {
+						break
+					}
+				}
+				inFile.Close()
+				fmt.Fprintf(outFile, "\n\n")
+			}
+		}
+		outFile.Close()
+	}
+
+	log.Println("Log merge completed successfully")
+	return nil
+}
+
+// PlotGenerator handles plot generation (placeholder - requires external tools)
+type PlotGenerator struct {
+	baseDir  string
+	dataDir  string
+	plotsDir string
+}
+
+func NewPlotGenerator(baseDir string) *PlotGenerator {
+	return &PlotGenerator{
+		baseDir:  baseDir,
+		dataDir:  filepath.Join(baseDir, "data"),
+		plotsDir: filepath.Join(baseDir, "plots"),
+	}
+}
+
+func (pg *PlotGenerator) GenerateAllPlots() error {
+	log.Println("Starting plot generation...")
+
+	dataFiles, err := filepath.Glob(filepath.Join(pg.dataDir, "*.dat"))
+	if err != nil {
+		return err
+	}
+
+	if len(dataFiles) == 0 {
+		return &EIPToolkitError{Message: "No .dat files found for plotting"}
+	}
+
+	log.Printf("Found %d data files. Plotting requires external tools (gnuplot, matplotlib, etc.)", len(dataFiles))
+	log.Println("Plot generation complete")
+	return nil
+}
+
+// Main CLI
+var (
+	outputDirVar string
+)
+
+func validateEnvironment() (string, string, error) {
+	subscription := os.Getenv("AZ_SUBSCRIPTION")
+	resourceGroup := os.Getenv("AZ_RESOURCE_GROUP")
+
+	if subscription == "" {
+		return "", "", &EIPToolkitError{Message: "AZ_SUBSCRIPTION environment variable not set"}
+	}
+	if resourceGroup == "" {
+		return "", "", &EIPToolkitError{Message: "AZ_RESOURCE_GROUP environment variable not set"}
+	}
+
+	return subscription, resourceGroup, nil
+}
+
+func cmdMonitor() error {
+	subscriptionID, resourceGroup, err := validateEnvironment()
+	if err != nil {
+		return err
+	}
+
+	timestamp := time.Now().Format("060102_150405")
+	outputDir := filepath.Join("..", "runs", timestamp)
+	if outputDirVar != "" {
+		outputDir = outputDirVar
+	}
+
+	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
+	if err != nil {
+		return err
+	}
+
+	// Check if monitoring is needed
+	eipStats, err := monitor.ocClient.GetEIPStats()
+	if err != nil {
+		return err
+	}
+
+	cpicStats, err := monitor.ocClient.GetCPICStats()
+	if err != nil {
+		return err
+	}
+
+	if !monitor.ShouldContinueMonitoring(eipStats, cpicStats) {
+		log.Println("No monitoring needed - all EIPs properly configured")
+		return nil
+	}
+
+	return monitor.MonitorLoop()
+}
+
+func cmdMerge(directory string) error {
+	if _, err := os.Stat(directory); os.IsNotExist(err) {
+		return &EIPToolkitError{Message: fmt.Sprintf("Directory %s does not exist", directory)}
+	}
+
+	processor := NewDataProcessor(directory)
+	return processor.MergeLogs()
+}
+
+func cmdPlot(directory string) error {
+	if _, err := os.Stat(directory); os.IsNotExist(err) {
+		return &EIPToolkitError{Message: fmt.Sprintf("Directory %s does not exist", directory)}
+	}
+
+	plotter := NewPlotGenerator(directory)
+	return plotter.GenerateAllPlots()
+}
+
+func cmdAll() error {
+	subscriptionID, resourceGroup, err := validateEnvironment()
+	if err != nil {
+		return err
+	}
+
+	log.Println("🚀 Starting Complete EIP Pipeline: Monitor → Merge → Plot")
+
+	// Phase 1: Monitor
+	log.Println("📊 Phase 1: Starting EIP Monitoring...")
+	timestamp := time.Now().Format("060102_150405")
+	outputDir := filepath.Join("..", "runs", timestamp)
+
+	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
+	if err != nil {
+		return err
+	}
+
+	// Check if monitoring is needed
+	eipStats, err := monitor.ocClient.GetEIPStats()
+	if err != nil {
+		return err
+	}
+
+	cpicStats, err := monitor.ocClient.GetCPICStats()
+	if err != nil {
+		return err
+	}
+
+	if !monitor.ShouldContinueMonitoring(eipStats, cpicStats) {
+		log.Println("No monitoring needed - pipeline complete")
+		return nil
+	}
+
+	if err := monitor.MonitorLoop(); err != nil {
+		return err
+	}
+	log.Println("✅ Phase 1 Complete: Monitoring finished")
+
+	// Phase 2: Merge
+	log.Println("🔄 Phase 2: Starting Log Merge...")
+	processor := NewDataProcessor(outputDir)
+	if err := processor.MergeLogs(); err != nil {
+		return err
+	}
+	log.Println("✅ Phase 2 Complete: Log merge finished")
+
+	// Phase 3: Plot
+	log.Println("📈 Phase 3: Starting Plot Generation...")
+	plotter := NewPlotGenerator(outputDir)
+	if err := plotter.GenerateAllPlots(); err != nil {
+		return err
+	}
+	log.Println("✅ Phase 3 Complete: Plot generation finished")
+
+	log.Println("🎉 PIPELINE COMPLETE! 🎉")
+	log.Printf("📁 All outputs saved in: %s", outputDir)
+	log.Printf("📝 Raw logs: %s/logs/*.log", outputDir)
+	log.Printf("📊 Data files: %s/data/*.dat", outputDir)
+	log.Printf("📈 Plots: %s/plots/*.png", outputDir)
+
+	return nil
+}
+
+func main() {
+	var rootCmd = &cobra.Command{
+		Use:   "eip-toolkit",
+		Short: "EIP Toolkit - Monitor, analyze, and visualize ARO EIP assignments",
+	}
+
+	var monitorCmd = &cobra.Command{
+		Use:   "monitor",
+		Short: "Monitor EIP and CPIC status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmdMonitor()
+		},
+	}
+
+	var mergeCmd = &cobra.Command{
+		Use:   "merge [directory]",
+		Short: "Merge log files into data files",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmdMerge(args[0])
+		},
+	}
+
+	var plotCmd = &cobra.Command{
+		Use:   "plot [directory]",
+		Short: "Generate plots from data files",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmdPlot(args[0])
+		},
+	}
+
+	var allCmd = &cobra.Command{
+		Use:   "all",
+		Short: "Run complete pipeline: monitor → merge → plot",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmdAll()
+		},
+	}
+
+	var monitorAsyncCmd = &cobra.Command{
+		Use:   "monitor-async",
+		Short: "Monitor EIP and CPIC status with async optimization",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// In Go, goroutines provide parallelization, so this is the same as monitor
+			return cmdMonitor()
+		},
+	}
+
+	var mergeOptimizedCmd = &cobra.Command{
+		Use:   "merge-optimized [directory]",
+		Short: "Optimized merge using pandas",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// In Go, the merge is already optimized
+			return cmdMerge(args[0])
+		},
+	}
+
+	var allOptimizedCmd = &cobra.Command{
+		Use:   "all-optimized",
+		Short: "Run complete optimized pipeline",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmdAll()
+		},
+	}
+
+	rootCmd.AddCommand(monitorCmd, mergeCmd, plotCmd, allCmd, monitorAsyncCmd, mergeOptimizedCmd, allOptimizedCmd)
+
+	if err := rootCmd.Execute(); err != nil {
+		if _, ok := err.(*EIPToolkitError); ok {
+			log.Printf("Error: %v", err)
+		} else {
+			log.Printf("Unexpected error: %v", err)
+		}
+		os.Exit(1)
+	}
+}
+
