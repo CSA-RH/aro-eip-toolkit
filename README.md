@@ -158,6 +158,23 @@ User
          └─> Save PNG files (plots/*.png)
 ```
 
+### Monitoring Output
+
+The monitoring command displays real-time statistics with:
+- **Timestamp**: Each iteration shows the current timestamp at the top
+- **Node Statistics**: Per-node CPIC (success/pending/error), EIP assigned, and Azure NIC stats
+- **Summary Stats**: Single-line summary showing Configured EIPs, Successful CPICs, and Assigned EIPs
+- **Value Highlighting**: Values that change between iterations are highlighted in yellow/bold
+- **In-place Updates**: Console output overwrites previous lines using ANSI escape codes (when output is to a terminal)
+
+Example output:
+```
+2025/11/04 17:55:22
+aro-worker-node1 - CPIC: 32/0/0, EIP: 32, Azure: 32/32
+aro-worker-node2 - CPIC: 33/0/0, EIP: 33, Azure: 33/33
+Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100
+```
+
 ### Monitoring Logic
 
 Monitoring loop continues while:
@@ -172,3 +189,6 @@ Exits when both conditions are false (all EIPs assigned, all CPICs successful).
 - **SmartCache**: Thread-safe caching with TTL and LRU eviction
 - **BufferedLogger**: Concurrent-safe buffered file I/O
 - **Error Handling**: Custom error types with proper error wrapping
+- **Real-time Console Updates**: ANSI escape codes for in-place output overwriting (terminal-aware)
+- **Value Change Highlighting**: Visual feedback for metrics that change between iterations
+- **Terminal Detection**: Automatically detects if output is to a terminal and adjusts formatting accordingly
