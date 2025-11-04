@@ -19,6 +19,7 @@ import (
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
+	"golang.org/x/term"
 )
 
 // EIPToolkitError represents toolkit-specific errors
@@ -618,10 +619,7 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor
 }
 
 func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats) bool {
-	log.Printf("Configured EIPs: %d", eipStats.Configured)
-	log.Printf("Successful CPICs: %d", cpicStats.Success)
-	log.Printf("Assigned EIPs: %d", eipStats.Assigned)
-
+	// Stats are already printed in MonitorLoop, no need to log here
 	return eipStats.Assigned != eipStats.Configured || cpicStats.Success != eipStats.Configured
 }
 
@@ -807,22 +805,29 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// Collect node data in parallel
 		nodeData := em.CollectNodeDataParallel(nodes, timestamp)
 
+		// Check if stdout is a terminal (for ANSI escape codes)
+		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
+
 		// Move cursor up to overwrite previous lines (if any)
-		if linesPrinted > 0 {
+		if linesPrinted > 0 && isTerminal {
 			fmt.Printf("\033[%dA", linesPrinted) // Move up N lines to get back to first line
 		}
 
-		// Print node statistics in sorted order (using \033[K to clear line)
+		// Print node statistics in sorted order (using \033[K to clear line if terminal)
+		clearLine := ""
+		if isTerminal {
+			clearLine = "\033[K"
+		}
 		for _, data := range nodeData {
-			fmt.Printf("\033[K%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d\n",
-				data.Node, data.CPICSuccess, data.CPICPending, data.CPICError,
+			fmt.Printf("%s%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d\n",
+				clearLine, data.Node, data.CPICSuccess, data.CPICPending, data.CPICError,
 				data.EIPAssigned, data.AzureEIPs, data.AzureLBs)
 		}
 
 		// Print summary stats
-		fmt.Printf("\033[KConfigured EIPs: %d\n", eipStats.Configured)
-		fmt.Printf("\033[KSuccessful CPICs: %d\n", cpicStats.Success)
-		fmt.Printf("\033[KAssigned EIPs: %d\n", eipStats.Assigned)
+		fmt.Printf("%sConfigured EIPs: %d\n", clearLine, eipStats.Configured)
+		fmt.Printf("%sSuccessful CPICs: %d\n", clearLine, cpicStats.Success)
+		fmt.Printf("%sAssigned EIPs: %d\n", clearLine, eipStats.Assigned)
 
 		// Update count of lines printed (nodes + 3 summary lines)
 		// After printing N lines with \n, cursor is on line N+1 (blank line)
