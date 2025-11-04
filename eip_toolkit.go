@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
-	"golang.org/x/term"
 )
 
 // EIPToolkitError represents toolkit-specific errors
@@ -775,6 +775,15 @@ func (em *EIPMonitor) MonitorLoop() error {
 	// Track number of lines we've printed (for overwriting)
 	linesPrinted := 0
 
+	// Track previous values for highlighting changes
+	prevValues := make(map[string]*NodeEIPData)
+
+	// Track previous summary stats for highlighting
+	var prevSummary struct {
+		configured, successful, assigned int
+		initialized                      bool
+	}
+
 	for {
 		timestamp := time.Now().Format(time.RFC3339)
 
@@ -813,26 +822,55 @@ func (em *EIPMonitor) MonitorLoop() error {
 			fmt.Printf("\033[%dA", linesPrinted) // Move up N lines to get back to first line
 		}
 
-		// Print node statistics in sorted order (using \033[K to clear line if terminal)
+		// Print timestamp for this iteration
+		timestampStr := time.Now().Format("2006/01/02 15:04:05")
 		clearLine := ""
 		if isTerminal {
 			clearLine = "\033[K"
 		}
+		fmt.Printf("%s%s\n", clearLine, timestampStr)
+
+		// Print node statistics in sorted order (using \033[K to clear line if terminal)
 		for _, data := range nodeData {
-			fmt.Printf("%s%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d\n",
-				clearLine, data.Node, data.CPICSuccess, data.CPICPending, data.CPICError,
-				data.EIPAssigned, data.AzureEIPs, data.AzureLBs)
+			prev, hasPrev := prevValues[data.Node]
+
+			// Format values with highlighting if changed
+			cpicSuccessStr := formatValue(data.CPICSuccess, prev != nil && prev.CPICSuccess != data.CPICSuccess, isTerminal)
+			cpicPendingStr := formatValue(data.CPICPending, prev != nil && prev.CPICPending != data.CPICPending, isTerminal)
+			cpicErrorStr := formatValue(data.CPICError, prev != nil && prev.CPICError != data.CPICError, isTerminal)
+			eipStr := formatValue(data.EIPAssigned, prev != nil && prev.EIPAssigned != data.EIPAssigned, isTerminal)
+			azureEIPsStr := formatValue(data.AzureEIPs, prev != nil && prev.AzureEIPs != data.AzureEIPs, isTerminal)
+			azureLBsStr := formatValue(data.AzureLBs, prev != nil && prev.AzureLBs != data.AzureLBs, isTerminal)
+
+			fmt.Printf("%s%s - CPIC: %s/%s/%s, EIP: %s, Azure: %s/%s\n",
+				clearLine, data.Node, cpicSuccessStr, cpicPendingStr, cpicErrorStr,
+				eipStr, azureEIPsStr, azureLBsStr)
+
+			// Store current values for next iteration
+			if !hasPrev {
+				prevValues[data.Node] = &NodeEIPData{}
+			}
+			*prevValues[data.Node] = *data
 		}
 
-		// Print summary stats
-		fmt.Printf("%sConfigured EIPs: %d\n", clearLine, eipStats.Configured)
-		fmt.Printf("%sSuccessful CPICs: %d\n", clearLine, cpicStats.Success)
-		fmt.Printf("%sAssigned EIPs: %d\n", clearLine, eipStats.Assigned)
+		// Format summary stats with highlighting
+		configuredStr := formatValue(eipStats.Configured, prevSummary.initialized && prevSummary.configured != eipStats.Configured, isTerminal)
+		successfulStr := formatValue(cpicStats.Success, prevSummary.initialized && prevSummary.successful != cpicStats.Success, isTerminal)
+		assignedStr := formatValue(eipStats.Assigned, prevSummary.initialized && prevSummary.assigned != eipStats.Assigned, isTerminal)
 
-		// Update count of lines printed (nodes + 3 summary lines)
+		fmt.Printf("%sConfigured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s\n",
+			clearLine, configuredStr, successfulStr, assignedStr)
+
+		// Store current summary for next iteration
+		prevSummary.configured = eipStats.Configured
+		prevSummary.successful = cpicStats.Success
+		prevSummary.assigned = eipStats.Assigned
+		prevSummary.initialized = true
+
+		// Update count of lines printed (timestamp + nodes + 1 summary line)
 		// After printing N lines with \n, cursor is on line N+1 (blank line)
-		linesPrinted = len(nodeData) + 3
-		
+		linesPrinted = 1 + len(nodeData) + 1
+
 		// Flush stdout to ensure output is displayed immediately
 		os.Stdout.Sync()
 
@@ -857,6 +895,15 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 	log.Println("Monitoring complete - all EIPs assigned and CPIC issues resolved")
 	return nil
+}
+
+// formatValue formats a value with highlighting if it changed
+func formatValue(value int, changed bool, isTerminal bool) string {
+	if !isTerminal || !changed {
+		return fmt.Sprintf("%d", value)
+	}
+	// Use yellow/bright yellow for changed values
+	return fmt.Sprintf("\033[33;1m%d\033[0m", value) // Yellow, bold
 }
 
 // DataProcessor handles log merging
