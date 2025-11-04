@@ -809,7 +809,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		// Move cursor up to overwrite previous lines (if any)
 		if linesPrinted > 0 {
-			fmt.Printf("\033[%dA", linesPrinted) // Move up N lines
+			fmt.Printf("\033[%dA", linesPrinted) // Move up N lines to get back to first line
 		}
 
 		// Print node statistics in sorted order (using \033[K to clear line)
@@ -825,16 +825,20 @@ func (em *EIPMonitor) MonitorLoop() error {
 		fmt.Printf("\033[KAssigned EIPs: %d\n", eipStats.Assigned)
 
 		// Update count of lines printed (nodes + 3 summary lines)
+		// After printing N lines with \n, cursor is on line N+1 (blank line)
 		linesPrinted = len(nodeData) + 3
+		
+		// Flush stdout to ensure output is displayed immediately
+		os.Stdout.Sync()
 
-		// Log aggregated cluster-wide EIP summary
+		// Log aggregated cluster-wide EIP summary (errors go to stderr, won't affect stdout)
 		if err := em.LogClusterSummary(timestamp, nodeData); err != nil {
-			log.Printf("Error creating cluster summary: %v", err)
+			fmt.Fprintf(os.Stderr, "Error creating cluster summary: %v\n", err)
 		}
 
-		// Flush all buffered logs
+		// Flush all buffered logs (errors go to stderr, won't affect stdout)
 		if err := em.bufferedLogger.FlushAll(); err != nil {
-			log.Printf("Error flushing logs: %v", err)
+			fmt.Fprintf(os.Stderr, "Error flushing logs: %v\n", err)
 		}
 
 		// Check if monitoring should continue
