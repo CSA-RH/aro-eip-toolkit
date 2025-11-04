@@ -49,3 +49,8 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.bak
+
+# Go binaries
+eip-toolkit
+eip-toolkit-simple
+eip-toolkit-ultra-simple
