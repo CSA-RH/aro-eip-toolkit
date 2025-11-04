@@ -965,7 +965,6 @@ func (pg *PlotGenerator) parseDataFile(filename string) (map[string][]DataPoint,
 		// Parse timestamp and value
 		parts := strings.Fields(line)
 		if len(parts) >= 2 {
-			// Parse timestamp (format: YYMMDD_HHMMSS)
 			timestampStr := parts[0]
 			valueStr := parts[1]
 
@@ -974,11 +973,22 @@ func (pg *PlotGenerator) parseDataFile(filename string) (map[string][]DataPoint,
 				continue // Skip invalid lines
 			}
 
-			// Parse timestamp
-			t, err := time.Parse("060102_150405", timestampStr)
-			if err != nil {
-				// Try alternative format if needed
-				continue
+			// Try parsing timestamp in multiple formats
+			var t time.Time
+			var parseErr error
+
+			// Try RFC3339 format first (e.g., "2025-11-04T17:05:42+01:00")
+			t, parseErr = time.Parse(time.RFC3339, timestampStr)
+			if parseErr != nil {
+				// Try YYMMDD_HHMMSS format (e.g., "251104_170542")
+				t, parseErr = time.Parse("060102_150405", timestampStr)
+				if parseErr != nil {
+					// Try RFC3339 without timezone (e.g., "2025-11-04T17:05:42Z")
+					t, parseErr = time.Parse("2006-01-02T15:04:05Z", timestampStr)
+					if parseErr != nil {
+						continue // Skip lines with unparseable timestamps
+					}
+				}
 			}
 
 			points = append(points, DataPoint{
