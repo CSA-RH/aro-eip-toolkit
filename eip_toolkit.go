@@ -629,6 +629,10 @@ type NodeEIPData struct {
 	Node        string
 	EIPAssigned int
 	AzureEIPs   int
+	AzureLBs    int
+	CPICSuccess int
+	CPICPending int
+	CPICError   int
 }
 
 func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData {
@@ -663,14 +667,16 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 		"lbs":  nodeStats.AzureLBs,
 	})
 
-	log.Printf("%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d",
-		node, nodeStats.CPICSuccess, nodeStats.CPICPending, nodeStats.CPICError,
-		nodeStats.EIPAssigned, nodeStats.AzureEIPs, nodeStats.AzureLBs)
+	// Don't log here - will log after sorting in MonitorLoop
 
 	return &NodeEIPData{
 		Node:        node,
 		EIPAssigned: nodeStats.EIPAssigned,
 		AzureEIPs:   azureEIPs,
+		AzureLBs:    azureLBs,
+		CPICSuccess: nodeStats.CPICSuccess,
+		CPICPending: nodeStats.CPICPending,
+		CPICError:   nodeStats.CPICError,
 	}
 }
 
@@ -703,12 +709,12 @@ func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) 
 	}
 
 	wg.Wait()
-	
+
 	// Sort results by node name for consistent ordering
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Node < results[j].Node
 	})
-	
+
 	return results
 }
 
@@ -742,14 +748,14 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 	defer f.Close()
 
 	fmt.Fprintf(f, "%s CLUSTER_SUMMARY\n", timestamp)
-	
+
 	// Sort node data for consistent ordering
 	sortedNodeData := make([]*NodeEIPData, len(nodeData))
 	copy(sortedNodeData, nodeData)
 	sort.Slice(sortedNodeData, func(i, j int) bool {
 		return sortedNodeData[i].Node < sortedNodeData[j].Node
 	})
-	
+
 	for _, data := range sortedNodeData {
 		fmt.Fprintf(f, "%s %s %d %d\n", timestamp, data.Node, data.EIPAssigned, data.AzureEIPs)
 	}
@@ -797,6 +803,13 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		// Collect node data in parallel
 		nodeData := em.CollectNodeDataParallel(nodes, timestamp)
+
+		// Log node statistics in sorted order
+		for _, data := range nodeData {
+			log.Printf("%s - CPIC: %d/%d/%d, EIP: %d, Azure: %d/%d",
+				data.Node, data.CPICSuccess, data.CPICPending, data.CPICError,
+				data.EIPAssigned, data.AzureEIPs, data.AzureLBs)
+		}
 
 		// Log aggregated cluster-wide EIP summary
 		if err := em.LogClusterSummary(timestamp, nodeData); err != nil {
