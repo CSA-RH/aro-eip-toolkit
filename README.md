@@ -136,11 +136,28 @@ User
          │   └─> oc get cloudprivateipconfig -o json
          │       └─> Parse JSON → CPICStats
          │
+         ├─> OpenShiftClient.CountMalfunctioningEIPObjects()
+         │   └─> DetectEIPCPICMismatches()
+         │       └─> Compare EIP status.items vs CPIC assignments
+         │
+         ├─> OpenShiftClient.CountOvercommittedEIPObjects()
+         │   └─> Count EIP resources with configured IPs > available nodes
+         │
          ├─> CollectNodeDataParallel() (goroutines)
+         │   ├─> OpenShiftClient.GetNodeStats()
+         │   │   ├─> Calculate Primary EIPs (first IP from each EIP resource)
+         │   │   └─> Calculate Secondary EIPs (CPIC Success - Primary)
          │   ├─> AzureClient.GetNodeNICStats()
          │   │   └─> az network nic show
          │   │       └─> Parse JSON → (ips, lbs)
          │   └─> BufferedLogger.LogStats()
+         │       ├─> Log primary/secondary/assigned EIPs per node
+         │       ├─> Log malfunctioning EIP count
+         │       └─> Log overcommitted EIP count
+         │
+         ├─> (After 10 iterations without progress)
+         │   ├─> DetectEIPCPICMismatches() (if not already done)
+         │   └─> DetectUnassignedEIPs() (if no mismatches detected)
          │
          └─> Write to log files (logs/*.log)
              └─> Repeat every 1 second until complete
@@ -182,26 +199,78 @@ User
 
 The monitoring command displays real-time statistics with:
 - **Timestamp**: Each iteration shows the current timestamp at the top
-- **Node Statistics**: Per-node CPIC (success/pending/error), EIP assigned, and Azure NIC stats
-- **Summary Stats**: Single-line summary showing Configured EIPs, Successful CPICs, and Assigned EIPs
+- **Node Statistics**: Per-node CPIC (success/pending/error), Primary EIPs, Secondary EIPs, and Azure NIC stats
+- **Summary Stats**: Single-line summary showing Configured EIPs, Successful CPICs, Assigned EIPs, Malfunction EIPs, Overcommitted EIPs, and CNCC status
 - **Value Highlighting**: Values that change between iterations are highlighted in yellow/bold
 - **In-place Updates**: Console output overwrites previous lines using ANSI escape codes (when output is to a terminal)
+- **Warnings**: After 10 iterations without progress, displays:
+  - EIP/CPIC mismatches (if any detected)
+  - Unassigned EIPs (if any detected)
+  - CPIC errors (if any detected)
 
 Example output:
 ```
 2025/11/04 17:55:22
-aro-worker-node1 - CPIC: 32/0/0, EIP: 32, Azure: 32/32
-aro-worker-node2 - CPIC: 33/0/0, EIP: 33, Azure: 33/33
-Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100
+aro-worker-node1 - CPIC: 32/0/0, Primary EIPs: 30, Secondary EIPs: 2, Azure: 32/32, Capacity: 223/255
+aro-worker-node2 - CPIC: 33/0/0, Primary EIPs: 31, Secondary EIPs: 2, Azure: 33/33, Capacity: 222/255
+Cluster Summary: Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 445/510
 ```
+
+**Key Metrics Explained:**
+- **Primary EIPs**: The first IP in the `status.items` list of each EIP resource assigned to the node. Each EIP resource contributes at most one Primary EIP.
+- **Secondary EIPs**: Additional IPs from the same EIP resource assigned to the node. Calculated as `CPIC Success - Primary EIPs`.
+- **Assigned EIPs**: Total assigned IPs (Primary + Secondary) across all nodes. Should match CPIC Success count.
+- **Malfunction EIPs**: EIP resources where IPs in `status.items` don't match CPIC assignments (node mismatches or missing in EIP status). Displayed in **red** if > 0.
+- **Overcommitted EIPs**: EIP resources that have more IPs configured than available nodes (cannot all be assigned). Displayed in **yellow** if > 0.
 
 ### Monitoring Logic
 
 Monitoring loop continues while:
-- `eipStats.Assigned != eipStats.Configured` OR
-- `cpicStats.Success != eipStats.Configured`
+- `eipStats.Assigned != expectedAssignable` OR
+- `cpicStats.Success != expectedAssignable`
 
-Exits when both conditions are false (all EIPs assigned, all CPICs successful).
+Where `expectedAssignable = Configured - unassignableIPs` (accounting for overcommitted EIPs).
+
+**Overcommitment Handling:**
+- EIP resources with more IPs configured than available nodes cannot assign all IPs
+- The monitoring logic accounts for this by calculating how many IPs are legitimately unassignable
+- Monitoring exits when all assignable IPs are assigned (not all configured IPs)
+
+**Mismatch Detection:**
+- EIP/CPIC mismatches are detected only after 10 iterations without progress
+- Overcommitted EIP resources are excluded from mismatch detection to avoid false positives
+- Detailed mismatch IP lists are shown only after 10 iterations without progress and hidden immediately when progress is detected
+
+**Unassigned EIP Detection:**
+- Unassigned EIPs are detected only after 10 iterations without progress
+- Only shown if no mismatches are already detected (to avoid duplicate reporting)
+
+### Logged Metrics
+
+The following metrics are logged to files for tracking and plotting:
+
+**Per-Node Metrics:**
+- `{node}_ocp_cpic_success.log`, `{node}_ocp_cpic_pending.log`, `{node}_ocp_cpic_error.log`
+- `{node}_ocp_eip_primary.log` - Primary EIPs count
+- `{node}_ocp_eip_secondary.log` - Secondary EIPs count
+- `{node}_ocp_eip_assigned.log` - Total assigned EIPs (Primary + Secondary)
+- `{node}_azure_eips.log`, `{node}_azure_lbs.log`
+- `{node}_capacity_capacity.log`
+
+**Cluster-Level Metrics:**
+- `ocp_eips_configured.log`, `ocp_eips_assigned.log`, `ocp_eips_unassigned.log`
+- `ocp_cpic_success.log`, `ocp_cpic_pending.log`, `ocp_cpic_error.log`
+- `cluster_summary_total_primary_eips.log` - Total Primary EIPs across all nodes
+- `cluster_summary_total_secondary_eips.log` - Total Secondary EIPs across all nodes
+- `cluster_summary_total_assigned_eips.log` - Total Assigned EIPs
+- `cluster_summary_total_azure_eips.log`
+- `cluster_summary_node_count.log`
+- `cluster_summary_avg_eips_per_node.log`
+- `malfunctioning_eip_objects_count.log` - Number of EIP resources with mismatches
+- `overcommitted_eip_objects_count.log` - Number of EIP resources overcommitted
+- `eip_cpic_mismatches_total.log` - Total mismatch count (only logged after 10 iterations without progress)
+- `eip_cpic_mismatches_node_mismatch.log` - Node assignment mismatches
+- `eip_cpic_mismatches_missing_in_eip.log` - IPs in CPIC but not in EIP status
 
 ### Go-Specific Features
 
@@ -212,3 +281,6 @@ Exits when both conditions are false (all EIPs assigned, all CPICs successful).
 - **Real-time Console Updates**: ANSI escape codes for in-place output overwriting (terminal-aware)
 - **Value Change Highlighting**: Visual feedback for metrics that change between iterations
 - **Terminal Detection**: Automatically detects if output is to a terminal and adjusts formatting accordingly
+- **Progress Tracking**: Tracks iterations without progress to conditionally display detailed warnings
+- **Mismatch Detection**: Detects inconsistencies between EIP and CPIC node assignments
+- **Overcommitment Detection**: Identifies EIP resources with more IPs than available nodes
