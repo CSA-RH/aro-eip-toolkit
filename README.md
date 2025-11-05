@@ -10,13 +10,13 @@ Download the pre-built binary for your platform from the [GitHub Releases](https
 
 **macOS (Apple Silicon):**
 ```bash
-curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.1.0/eip-toolkit-darwin-arm64
+curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.2.0/eip-toolkit-darwin-arm64
 chmod +x eip-toolkit
 ```
 
 **Linux (x86_64):**
 ```bash
-curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.1.0/eip-toolkit-linux-amd64
+curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.2.0/eip-toolkit-linux-amd64
 chmod +x eip-toolkit
 ```
 
