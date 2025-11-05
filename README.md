@@ -4,6 +4,32 @@ Monitors Azure Red Hat OpenShift Egress IP assignments and CloudPrivateIPConfig 
 
 ## Installation
 
+### Using Pre-built Binaries (Recommended)
+
+Download the pre-built binary for your platform from the [GitHub Releases](https://github.com/CSA-RH/aro-eip-toolkit/releases):
+
+**macOS (Apple Silicon):**
+```bash
+curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.1.0/eip-toolkit-darwin-arm64
+chmod +x eip-toolkit
+```
+
+**Linux (x86_64):**
+```bash
+curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.1.0/eip-toolkit-linux-amd64
+chmod +x eip-toolkit
+```
+
+Then set environment variables:
+```bash
+export AZ_SUBSCRIPTION="your-subscription-id"
+export AZ_RESOURCE_GROUP="your-resource-group"
+```
+
+### Building from Source
+
+If you prefer to build from source:
+
 ```bash
 go mod download
 make build-main
