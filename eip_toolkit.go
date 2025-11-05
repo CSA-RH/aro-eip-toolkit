@@ -693,8 +693,17 @@ type UnassignedEIP struct {
 
 // DetectEIPCPICMismatches compares EIP status.items node assignments with CPIC CloudResponseSuccess assignments
 // Returns a list of mismatches where the same IP is assigned to different nodes
+// Accounts for the constraint that only one IP can be assigned per node (to avoid false positives)
 func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) {
 	var mismatches []EIPCPICMismatch
+
+	// Get count of available nodes (nodes with egress-assignable label)
+	// This is needed to determine if unassigned IPs are legitimate (due to node capacity) or mismatches
+	availableNodes, err := oc.GetEIPEnabledNodes()
+	availableNodeCount := 0
+	if err == nil {
+		availableNodeCount = len(availableNodes)
+	}
 
 	// Get CPIC IP->node mapping (already exists)
 	cpicIPToNode, err := oc.GetIPToNodeMapping()
@@ -713,11 +722,17 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 	eipIPToNode := make(map[string]string)
 	eipIPToResource := make(map[string]string)
 
+	// Track EIP resources: configured IPs count and assigned IPs count per resource
+	eipResourceConfig := make(map[string]int)   // resource -> configured IP count
+	eipResourceAssigned := make(map[string]int) // resource -> assigned IP count (in status.items with node)
+
 	items, ok := eipData["items"].([]interface{})
 	if !ok {
 		return mismatches, nil
 	}
 
+	// First pass: identify overcommitted EIP resources and build the set
+	overcommittedResources := make(map[string]bool)
 	for _, item := range items {
 		itemMap, ok := item.(map[string]interface{})
 		if !ok {
@@ -739,6 +754,48 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 
 		// Get configured IPs from spec.egressIPs
 		spec, ok := itemMap["spec"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		configuredCount := 0
+		if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+			configuredCount = len(egressIPs)
+		}
+
+		// Mark resource as overcommitted if configured IPs > available nodes
+		if availableNodeCount > 0 && configuredCount > availableNodeCount {
+			overcommittedResources[resourceName] = true
+		}
+	}
+
+	// Second pass: build EIP IP->node mapping, excluding overcommitted resources
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get EIP resource name/namespace
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		// Skip overcommitted resources entirely
+		if overcommittedResources[resourceName] {
+			continue
+		}
+
+		// Get configured IPs from spec.egressIPs
+		spec, ok := itemMap["spec"].(map[string]interface{})
 		var configuredIPs []string
 		if ok {
 			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
@@ -749,6 +806,8 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 				}
 			}
 		}
+		// Track configured IP count for this resource
+		eipResourceConfig[resourceName] = len(configuredIPs)
 
 		// Get assigned IPs from status.items
 		status, ok := itemMap["status"].(map[string]interface{})
@@ -817,10 +876,24 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 		}
 	}
 
+	// Count assigned IPs per resource (after building the maps)
+	for _, resName := range eipIPToResource {
+		if resName != "" {
+			eipResourceAssigned[resName]++
+		}
+	}
+
 	// Compare EIP and CPIC mappings
 	// Flag actual node assignment mismatches (where same IP is on different nodes)
 	// Also flag IPs in CPIC with CloudResponseSuccess but not in EIP status.items
+	// Exclude IPs from overcommitted resources
 	for ip, eipNode := range eipIPToNode {
+		// Skip IPs from overcommitted resources
+		resourceName := eipIPToResource[ip]
+		if resourceName != "" && overcommittedResources[resourceName] {
+			continue
+		}
+
 		cpicNode, existsInCPIC := cpicIPToNode[ip]
 		if existsInCPIC && eipNode != cpicNode {
 			// IP assigned to different nodes - this is a real mismatch
@@ -828,7 +901,7 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 				IP:           ip,
 				EIPNode:      eipNode,
 				CPICNode:     cpicNode,
-				EIPResource:  eipIPToResource[ip],
+				EIPResource:  resourceName,
 				MismatchType: "node_mismatch",
 			})
 		}
@@ -837,6 +910,7 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 	// Check for IPs in CPIC (CloudResponseSuccess) but not in EIP status.items
 	// This indicates CPIC succeeded but EIP status hasn't been updated
 	// Try to find which EIP resource this IP belongs to by checking spec.egressIPs
+	// Exclude overcommitted resources from this mapping
 	eipResourceMap := make(map[string]string) // IP -> resource name
 	for _, item := range items {
 		itemMap, ok := item.(map[string]interface{})
@@ -856,6 +930,11 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 			}
 		}
 
+		// Skip overcommitted resources
+		if overcommittedResources[resourceName] {
+			continue
+		}
+
 		spec, ok := itemMap["spec"].(map[string]interface{})
 		if ok {
 			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
@@ -870,19 +949,60 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 
 	// Check for IPs in CPIC with CloudResponseSuccess but not in EIP status.items
 	// This indicates CPIC succeeded but EIP status hasn't been updated
+	// BUT: Don't flag if the EIP resource is already at capacity (one IP per available node)
+	// Also exclude IPs from overcommitted resources
 	for ip, cpicNode := range cpicIPToNode {
 		_, existsInEIP := eipIPToNode[ip]
 		if !existsInEIP {
 			// IP is in CPIC with CloudResponseSuccess but not in EIP status.items
-			// This is a mismatch - CPIC shows it's assigned but EIP doesn't
 			resourceName := eipResourceMap[ip]
-			mismatches = append(mismatches, EIPCPICMismatch{
-				IP:           ip,
-				EIPNode:      "",
-				CPICNode:     cpicNode,
-				EIPResource:  resourceName,
-				MismatchType: "missing_in_eip",
-			})
+
+			// Skip IPs from overcommitted resources
+			if resourceName != "" && overcommittedResources[resourceName] {
+				continue
+			}
+
+			if resourceName != "" {
+				// Check if this EIP resource is at capacity (has assigned IPs equal to available nodes)
+				// If so, unassigned IPs are legitimate (due to node capacity constraint)
+				assignedCount := eipResourceAssigned[resourceName]
+				configuredCount := eipResourceConfig[resourceName]
+
+				// Only flag as mismatch if:
+				// The resource has fewer assigned IPs than the maximum possible (min(configuredCount, availableNodeCount))
+				// This means: if assignedCount >= min(configuredCount, availableNodeCount), then remaining IPs are legitimately unassigned
+				isAtCapacity := false
+				if availableNodeCount > 0 {
+					maxPossibleAssignments := configuredCount
+					if configuredCount > availableNodeCount {
+						maxPossibleAssignments = availableNodeCount
+					}
+					if assignedCount >= maxPossibleAssignments {
+						isAtCapacity = true
+					}
+				}
+
+				if !isAtCapacity {
+					// This is a mismatch - CPIC shows it's assigned but EIP doesn't, and resource isn't at capacity
+					mismatches = append(mismatches, EIPCPICMismatch{
+						IP:           ip,
+						EIPNode:      "",
+						CPICNode:     cpicNode,
+						EIPResource:  resourceName,
+						MismatchType: "missing_in_eip",
+					})
+				}
+			} else {
+				// IP is in CPIC but we can't determine which EIP resource it belongs to
+				// Still flag as mismatch (orphaned CPIC)
+				mismatches = append(mismatches, EIPCPICMismatch{
+					IP:           ip,
+					EIPNode:      "",
+					CPICNode:     cpicNode,
+					EIPResource:  "",
+					MismatchType: "missing_in_eip",
+				})
+			}
 		}
 	}
 
@@ -957,7 +1077,7 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 					// IP is configured in EIP spec but not in EIP status.items
 					// Check if it has a CPIC with node assignment
 					if cpicNode, hasCPICNode := cpicAllIPToNode[ip]; hasCPICNode {
-						// IP has CPIC with node assignment but not in EIP status.items - mismatch
+						// IP has CPIC with node assignment but not in EIP status.items
 						// Check if we already reported this IP (from CloudResponseSuccess check above)
 						alreadyReported := false
 						for _, m := range mismatches {
@@ -967,13 +1087,30 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 							}
 						}
 						if !alreadyReported {
-							mismatches = append(mismatches, EIPCPICMismatch{
-								IP:           ip,
-								EIPNode:      "",
-								CPICNode:     cpicNode,
-								EIPResource:  resourceName,
-								MismatchType: "missing_in_eip",
-							})
+							// Check if this EIP resource is at capacity
+							assignedCount := eipResourceAssigned[resourceName]
+							configuredCount := eipResourceConfig[resourceName]
+							isAtCapacity := false
+							if availableNodeCount > 0 {
+								maxPossibleAssignments := configuredCount
+								if configuredCount > availableNodeCount {
+									maxPossibleAssignments = availableNodeCount
+								}
+								if assignedCount >= maxPossibleAssignments {
+									isAtCapacity = true
+								}
+							}
+
+							if !isAtCapacity {
+								// This is a mismatch - IP has CPIC node assignment but not in EIP status.items, and resource isn't at capacity
+								mismatches = append(mismatches, EIPCPICMismatch{
+									IP:           ip,
+									EIPNode:      "",
+									CPICNode:     cpicNode,
+									EIPResource:  resourceName,
+									MismatchType: "missing_in_eip",
+								})
+							}
 						}
 					}
 				}
@@ -981,10 +1118,18 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 
 			// Also check IPs in CPIC with node assignment but not in EIP status.items
 			// (This catches cases where IP might not be in eipResourceMap but is in CPIC)
+			// Exclude overcommitted resources
 			for ip, cpicNode := range cpicAllIPToNode {
 				_, existsInEIPStatus := eipIPToNode[ip]
 				if !existsInEIPStatus {
 					// IP is in CPIC with node assignment but not in EIP status.items
+					resourceName := eipResourceMap[ip]
+
+					// Skip IPs from overcommitted resources
+					if resourceName != "" && overcommittedResources[resourceName] {
+						continue
+					}
+
 					// Check if we already reported this IP
 					alreadyReported := false
 					for _, m := range mismatches {
@@ -994,14 +1139,41 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 						}
 					}
 					if !alreadyReported {
-						resourceName := eipResourceMap[ip]
-						mismatches = append(mismatches, EIPCPICMismatch{
-							IP:           ip,
-							EIPNode:      "",
-							CPICNode:     cpicNode,
-							EIPResource:  resourceName,
-							MismatchType: "missing_in_eip",
-						})
+						if resourceName != "" {
+							// Check if this EIP resource is at capacity
+							assignedCount := eipResourceAssigned[resourceName]
+							configuredCount := eipResourceConfig[resourceName]
+							isAtCapacity := false
+							if availableNodeCount > 0 {
+								maxPossibleAssignments := configuredCount
+								if configuredCount > availableNodeCount {
+									maxPossibleAssignments = availableNodeCount
+								}
+								if assignedCount >= maxPossibleAssignments {
+									isAtCapacity = true
+								}
+							}
+
+							if !isAtCapacity {
+								mismatches = append(mismatches, EIPCPICMismatch{
+									IP:           ip,
+									EIPNode:      "",
+									CPICNode:     cpicNode,
+									EIPResource:  resourceName,
+									MismatchType: "missing_in_eip",
+								})
+							}
+						} else {
+							// IP is in CPIC but we can't determine which EIP resource it belongs to
+							// Still flag as mismatch (orphaned CPIC)
+							mismatches = append(mismatches, EIPCPICMismatch{
+								IP:           ip,
+								EIPNode:      "",
+								CPICNode:     cpicNode,
+								EIPResource:  "",
+								MismatchType: "missing_in_eip",
+							})
+						}
 					}
 				}
 			}
@@ -1009,6 +1181,77 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 	}
 
 	return mismatches, nil
+}
+
+// CountOvercommittedEIPObjects counts EIP objects (resources) that have more IPs configured than available nodes
+// An EIP resource is overcommitted if configured IPs > number of nodes with egress-assignable label
+func (oc *OpenShiftClient) CountOvercommittedEIPObjects() (int, error) {
+	// Get count of available nodes
+	availableNodes, err := oc.GetEIPEnabledNodes()
+	availableNodeCount := 0
+	if err == nil {
+		availableNodeCount = len(availableNodes)
+	}
+
+	if availableNodeCount == 0 {
+		return 0, nil // No nodes available, can't determine overcommitment
+	}
+
+	// Get EIP data
+	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return 0, fmt.Errorf("failed to get EIP data: %w", err)
+	}
+
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return 0, nil
+	}
+
+	overcommittedCount := 0
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get configured IPs from spec.egressIPs
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		configuredCount := 0
+		if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+			configuredCount = len(egressIPs)
+		}
+
+		// Resource is overcommitted if configured IPs > available nodes
+		if configuredCount > availableNodeCount {
+			overcommittedCount++
+		}
+	}
+
+	return overcommittedCount, nil
+}
+
+// CountMalfunctioningEIPObjects counts EIP objects (resources) that have mismatches between their status.items and CPIC
+// An EIP object is malfunctioning if any of its IPs in status.items don't match CPIC assignments
+func (oc *OpenShiftClient) CountMalfunctioningEIPObjects() (int, error) {
+	mismatches, err := oc.DetectEIPCPICMismatches()
+	if err != nil {
+		return 0, err
+	}
+
+	// Collect unique EIP resource names that have mismatches
+	malfunctioningResources := make(map[string]bool)
+	for _, m := range mismatches {
+		if m.EIPResource != "" {
+			malfunctioningResources[m.EIPResource] = true
+		}
+	}
+
+	return len(malfunctioningResources), nil
 }
 
 // DetectUnassignedEIPs finds EIPs that are configured but not assigned, and determines why
@@ -1826,9 +2069,61 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor
 	}, nil
 }
 
-func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats) bool {
+func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats, overcommittedEIPs int) bool {
 	// Stats are already printed in MonitorLoop, no need to log here
-	return eipStats.Assigned != eipStats.Configured || cpicStats.Success != eipStats.Configured
+
+	// If there are overcommitted EIPs, calculate expected assignable IPs
+	// Overcommitted resources have more IPs configured than available nodes
+	// Those extra IPs cannot be assigned, so we need to account for them
+	expectedAssignable := eipStats.Configured
+
+	if overcommittedEIPs > 0 {
+		// Get available nodes count to calculate unassignable IPs
+		availableNodes, err := em.ocClient.GetEIPEnabledNodes()
+		availableNodeCount := 0
+		if err == nil {
+			availableNodeCount = len(availableNodes)
+		}
+
+		if availableNodeCount > 0 {
+			// Get EIP data to calculate total unassignable IPs
+			eipData, err := em.ocClient.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+			if err == nil {
+				if items, ok := eipData["items"].([]interface{}); ok {
+					unassignableIPs := 0
+					for _, item := range items {
+						itemMap, ok := item.(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						spec, ok := itemMap["spec"].(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						configuredCount := 0
+						if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+							configuredCount = len(egressIPs)
+						}
+
+						// If this resource is overcommitted, calculate unassignable IPs
+						if configuredCount > availableNodeCount {
+							unassignableIPs += configuredCount - availableNodeCount
+						}
+					}
+
+					// Expected assignable = configured - unassignable due to overcommitment
+					expectedAssignable = eipStats.Configured - unassignableIPs
+				}
+			}
+		}
+	}
+
+	// Continue monitoring if:
+	// 1. Assigned IPs don't match expected assignable (accounting for overcommitment), OR
+	// 2. CPIC success doesn't match expected assignable
+	return eipStats.Assigned != expectedAssignable || cpicStats.Success != expectedAssignable
 }
 
 type NodeStatus string
@@ -1891,7 +2186,9 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 	})
 
 	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_eip", node), map[string]interface{}{
-		"assigned": nodeStats.EIPAssigned,
+		"primary":   nodeStats.EIPAssigned,
+		"secondary": nodeStats.SecondaryEIPs,
+		"assigned":  nodeStats.EIPAssigned + nodeStats.SecondaryEIPs, // Total assigned (Primary + Secondary)
 	})
 
 	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_azure", node), map[string]interface{}{
@@ -1958,10 +2255,14 @@ func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) 
 }
 
 func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPData) error {
+	totalPrimaryEIPs := 0
+	totalSecondaryEIPs := 0
 	totalAssignedEIPs := 0
 	totalAzureEIPs := 0
 	for _, data := range nodeData {
-		totalAssignedEIPs += data.EIPAssigned
+		totalPrimaryEIPs += data.EIPAssigned
+		totalSecondaryEIPs += data.SecondaryEIPs
+		totalAssignedEIPs += data.EIPAssigned + data.SecondaryEIPs
 		totalAzureEIPs += data.AzureEIPs
 	}
 
@@ -1972,10 +2273,12 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 	}
 
 	em.bufferedLogger.LogStats(timestamp, "cluster_summary", map[string]interface{}{
-		"total_assigned_eips": totalAssignedEIPs,
-		"total_azure_eips":    totalAzureEIPs,
-		"node_count":          nodeCount,
-		"avg_eips_per_node":   avgEIPs,
+		"total_primary_eips":   totalPrimaryEIPs,
+		"total_secondary_eips": totalSecondaryEIPs,
+		"total_assigned_eips":  totalAssignedEIPs,
+		"total_azure_eips":     totalAzureEIPs,
+		"node_count":           nodeCount,
+		"avg_eips_per_node":    avgEIPs,
 	})
 
 	// Write detailed summary
@@ -1996,9 +2299,9 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 	})
 
 	for _, data := range sortedNodeData {
-		fmt.Fprintf(f, "%s %s %d %d\n", timestamp, data.Node, data.EIPAssigned, data.AzureEIPs)
+		fmt.Fprintf(f, "%s %s %d %d %d %d\n", timestamp, data.Node, data.EIPAssigned, data.SecondaryEIPs, data.EIPAssigned+data.SecondaryEIPs, data.AzureEIPs)
 	}
-	fmt.Fprintf(f, "%s TOTAL %d %d\n\n", timestamp, totalAssignedEIPs, totalAzureEIPs)
+	fmt.Fprintf(f, "%s TOTAL %d %d %d %d\n\n", timestamp, totalPrimaryEIPs, totalSecondaryEIPs, totalAssignedEIPs, totalAzureEIPs)
 
 	return nil
 }
@@ -2060,6 +2363,22 @@ func (em *EIPMonitor) MonitorLoop() error {
 			cnccStats = &CNCCStats{} // Use empty stats
 		}
 
+		// Get malfunctioning EIP objects count
+		malfunctioningEIPs, err := em.ocClient.CountMalfunctioningEIPObjects()
+		if err != nil {
+			// Log error but don't fail - malfunctioning count is optional
+			fmt.Fprintf(os.Stderr, "Warning: Failed to count malfunctioning EIP objects: %v\n", err)
+			malfunctioningEIPs = 0
+		}
+
+		// Get overcommitted EIP objects count
+		overcommittedEIPs, err := em.ocClient.CountOvercommittedEIPObjects()
+		if err != nil {
+			// Log error but don't fail - overcommitted count is optional
+			fmt.Fprintf(os.Stderr, "Warning: Failed to count overcommitted EIP objects: %v\n", err)
+			overcommittedEIPs = 0
+		}
+
 		// Log global statistics
 		em.bufferedLogger.LogStats(timestamp, "ocp_eips", map[string]interface{}{
 			"configured": eipStats.Configured,
@@ -2071,6 +2390,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 			"success": cpicStats.Success,
 			"pending": cpicStats.Pending,
 			"error":   cpicStats.Error,
+		})
+
+		em.bufferedLogger.LogStats(timestamp, "malfunctioning_eip_objects", map[string]interface{}{
+			"count": malfunctioningEIPs,
 		})
 
 		// Collect node data in parallel
@@ -2196,6 +2519,18 @@ func (em *EIPMonitor) MonitorLoop() error {
 		successfulStr := formatValue(cpicStats.Success, prevSummary.initialized && prevSummary.successful != cpicStats.Success, isTerminal)
 		assignedStr := formatValue(totalAssignedEIPs, prevSummary.initialized && prevSummary.assigned != totalAssignedEIPs, isTerminal)
 
+		// Format malfunctioning EIPs - red if > 0
+		malfunctionStr := fmt.Sprintf("%d", malfunctioningEIPs)
+		if malfunctioningEIPs > 0 && isTerminal {
+			malfunctionStr = fmt.Sprintf("\033[31;1m%d\033[0m", malfunctioningEIPs)
+		}
+
+		// Format overcommitted EIPs - yellow if > 0 (warning, not error)
+		overcommittedStr := fmt.Sprintf("%d", overcommittedEIPs)
+		if overcommittedEIPs > 0 && isTerminal {
+			overcommittedStr = fmt.Sprintf("\033[33;1m%d\033[0m", overcommittedEIPs)
+		}
+
 		// Format CNCC stats with highlighting
 		cnccRunningStr := formatValue(cnccStats.PodsRunning, prevSummary.initialized && prevSummary.cnccRunning != cnccStats.PodsRunning, isTerminal)
 		cnccReadyStr := formatValue(cnccStats.PodsReady, prevSummary.initialized && prevSummary.cnccReady != cnccStats.PodsReady, isTerminal)
@@ -2236,8 +2571,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		fmt.Printf("%s%s Configured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s, CNCC: %s/%s%s%s\n",
-			clearLine, summaryLabel, configuredStr, successfulStr, assignedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+		fmt.Printf("%s%s Configured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+			clearLine, summaryLabel, configuredStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 
 		// Track if we need to display error/warning messages
 		hasErrorMessage := false
@@ -2245,107 +2580,119 @@ func (em *EIPMonitor) MonitorLoop() error {
 		var mismatches []EIPCPICMismatch // Store mismatches for detailed display later
 		var unassignedCount int
 
-		// Check for EIP/CPIC mismatches
-		detectedMismatches, err := em.ocClient.DetectEIPCPICMismatches()
-		if err != nil {
-			log.Printf("Warning: Failed to detect EIP/CPIC mismatches: %v", err)
-		} else if len(detectedMismatches) > 0 {
-			mismatches = detectedMismatches
-			mismatchCount = len(mismatches)
-			// Count mismatches by type
-			nodeMismatches := 0
-			missingInEIP := 0
-			for _, m := range mismatches {
-				if m.MismatchType == "node_mismatch" {
-					nodeMismatches++
-				} else if m.MismatchType == "missing_in_eip" {
-					missingInEIP++
-				}
-			}
-
-			// Show summary always, but detailed IPs only after 10 iterations without progress
-			var parts []string
-			if nodeMismatches > 0 {
-				parts = append(parts, fmt.Sprintf("%d node mismatch(es)", nodeMismatches))
-			}
-			if missingInEIP > 0 {
-				parts = append(parts, fmt.Sprintf("%d in CPIC but not in EIP", missingInEIP))
-			}
-
-			fmt.Printf("%s\033[33;1m⚠️  EIP/CPIC Mismatch: %d IP(s) - %s\033[0m\n",
-				clearLine, len(mismatches), strings.Join(parts, ", "))
-
-			// Show detailed IPs only after 10 iterations without progress
-			// Hide immediately when progress is detected (iterationsWithoutProgress == 0 means progress was just made)
-			if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 && progressTracker.iterationsWithoutProgress > 0 {
-				// Collect and format IPs for display (limit to first 20 for readability)
-				type ipDisplay struct {
-					ip      string
-					display string
-				}
-				var nodeMismatchIPs []ipDisplay
-				var missingInEIPIPs []ipDisplay
-				maxDisplay := 20
-
-				for _, m := range mismatches {
+		// Check for EIP/CPIC mismatches only after 10 iterations without progress
+		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
+			detectedMismatches, err := em.ocClient.DetectEIPCPICMismatches()
+			if err != nil {
+				log.Printf("Warning: Failed to detect EIP/CPIC mismatches: %v", err)
+			} else {
+				// Always log mismatch stats (even if count is 0) so we can track when they're resolved
+				mismatchCount = len(detectedMismatches)
+				// Count mismatches by type
+				nodeMismatches := 0
+				missingInEIP := 0
+				for _, m := range detectedMismatches {
 					if m.MismatchType == "node_mismatch" {
-						if len(nodeMismatchIPs) < maxDisplay {
-							nodeMismatchIPs = append(nodeMismatchIPs, ipDisplay{
-								ip:      m.IP,
-								display: fmt.Sprintf("%s (EIP: %s, CPIC: %s)", m.IP, m.EIPNode, m.CPICNode),
-							})
-						}
+						nodeMismatches++
 					} else if m.MismatchType == "missing_in_eip" {
-						if len(missingInEIPIPs) < maxDisplay {
-							var display string
-							if m.EIPResource != "" {
-								display = fmt.Sprintf("%s (%s → %s)", m.IP, m.EIPResource, m.CPICNode)
-							} else {
-								display = fmt.Sprintf("%s (→ %s)", m.IP, m.CPICNode)
+						missingInEIP++
+					}
+				}
+
+				// Log mismatch statistics
+				em.bufferedLogger.LogStats(timestamp, "eip_cpic_mismatches", map[string]interface{}{
+					"total":          mismatchCount,
+					"node_mismatch":  nodeMismatches,
+					"missing_in_eip": missingInEIP,
+				})
+
+				if len(detectedMismatches) > 0 {
+					mismatches = detectedMismatches
+
+					// Show summary and detailed IPs (only displayed after 10 iterations without progress)
+					var parts []string
+					if nodeMismatches > 0 {
+						parts = append(parts, fmt.Sprintf("%d node mismatch(es)", nodeMismatches))
+					}
+					if missingInEIP > 0 {
+						parts = append(parts, fmt.Sprintf("%d in CPIC but not in EIP", missingInEIP))
+					}
+
+					fmt.Printf("%s\033[33;1m⚠️  EIP/CPIC Mismatch: %d IP(s) - %s\033[0m\n",
+						clearLine, len(mismatches), strings.Join(parts, ", "))
+
+					// Show detailed IPs
+					if progressTracker.iterationsWithoutProgress > 0 {
+						// Collect and format IPs for display (limit to first 20 for readability)
+						type ipDisplay struct {
+							ip      string
+							display string
+						}
+						var nodeMismatchIPs []ipDisplay
+						var missingInEIPIPs []ipDisplay
+						maxDisplay := 20
+
+						for _, m := range mismatches {
+							if m.MismatchType == "node_mismatch" {
+								if len(nodeMismatchIPs) < maxDisplay {
+									nodeMismatchIPs = append(nodeMismatchIPs, ipDisplay{
+										ip:      m.IP,
+										display: fmt.Sprintf("%s (EIP: %s, CPIC: %s)", m.IP, m.EIPNode, m.CPICNode),
+									})
+								}
+							} else if m.MismatchType == "missing_in_eip" {
+								if len(missingInEIPIPs) < maxDisplay {
+									var display string
+									if m.EIPResource != "" {
+										display = fmt.Sprintf("%s (%s → %s)", m.IP, m.EIPResource, m.CPICNode)
+									} else {
+										display = fmt.Sprintf("%s (→ %s)", m.IP, m.CPICNode)
+									}
+									missingInEIPIPs = append(missingInEIPIPs, ipDisplay{
+										ip:      m.IP,
+										display: display,
+									})
+								}
 							}
-							missingInEIPIPs = append(missingInEIPIPs, ipDisplay{
-								ip:      m.IP,
-								display: display,
-							})
+						}
+
+						// Sort by IP address for consistent output between iterations
+						sort.Slice(nodeMismatchIPs, func(i, j int) bool {
+							return nodeMismatchIPs[i].ip < nodeMismatchIPs[j].ip
+						})
+						sort.Slice(missingInEIPIPs, func(i, j int) bool {
+							return missingInEIPIPs[i].ip < missingInEIPIPs[j].ip
+						})
+
+						// Display detailed IPs in a readable format
+						if len(nodeMismatchIPs) > 0 {
+							displayCount := len(nodeMismatchIPs)
+							if nodeMismatches > maxDisplay {
+								fmt.Printf("%s   Node mismatches (%d shown of %d):\n", clearLine, displayCount, nodeMismatches)
+							} else {
+								fmt.Printf("%s   Node mismatches:\n", clearLine)
+							}
+							for _, item := range nodeMismatchIPs {
+								fmt.Printf("%s   - %s\n", clearLine, item.display)
+							}
+						}
+
+						if len(missingInEIPIPs) > 0 {
+							displayCount := len(missingInEIPIPs)
+							if missingInEIP > maxDisplay {
+								fmt.Printf("%s   Missing in EIP (%d shown of %d):\n", clearLine, displayCount, missingInEIP)
+							} else {
+								fmt.Printf("%s   Missing in EIP:\n", clearLine)
+							}
+							for _, item := range missingInEIPIPs {
+								fmt.Printf("%s   - %s\n", clearLine, item.display)
+							}
 						}
 					}
-				}
 
-				// Sort by IP address for consistent output between iterations
-				sort.Slice(nodeMismatchIPs, func(i, j int) bool {
-					return nodeMismatchIPs[i].ip < nodeMismatchIPs[j].ip
-				})
-				sort.Slice(missingInEIPIPs, func(i, j int) bool {
-					return missingInEIPIPs[i].ip < missingInEIPIPs[j].ip
-				})
-
-				// Display detailed IPs in a readable format
-				if len(nodeMismatchIPs) > 0 {
-					displayCount := len(nodeMismatchIPs)
-					if nodeMismatches > maxDisplay {
-						fmt.Printf("%s   Node mismatches (%d shown of %d):\n", clearLine, displayCount, nodeMismatches)
-					} else {
-						fmt.Printf("%s   Node mismatches:\n", clearLine)
-					}
-					for _, item := range nodeMismatchIPs {
-						fmt.Printf("%s   - %s\n", clearLine, item.display)
-					}
-				}
-
-				if len(missingInEIPIPs) > 0 {
-					displayCount := len(missingInEIPIPs)
-					if missingInEIP > maxDisplay {
-						fmt.Printf("%s   Missing in EIP (%d shown of %d):\n", clearLine, displayCount, missingInEIP)
-					} else {
-						fmt.Printf("%s   Missing in EIP:\n", clearLine)
-					}
-					for _, item := range missingInEIPIPs {
-						fmt.Printf("%s   - %s\n", clearLine, item.display)
-					}
+					hasErrorMessage = true
 				}
 			}
-
-			hasErrorMessage = true
 		}
 
 		// Check for unassigned EIPs only after 10 iterations without progress
@@ -2541,7 +2888,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 		}
 
 		// Check if monitoring should continue
-		if !em.ShouldContinueMonitoring(eipStats, cpicStats) {
+		if !em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
 			fmt.Printf("\n") // Add final newline
 			break
 		}
@@ -2967,7 +3314,12 @@ func cmdMonitor() error {
 
 	// Create a temporary monitor just for the check
 	tempMonitor := &EIPMonitor{ocClient: ocClient}
-	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats) {
+	// Get overcommitted count for the check
+	overcommittedEIPs, err := ocClient.CountOvercommittedEIPObjects()
+	if err != nil {
+		overcommittedEIPs = 0 // Default to 0 if we can't determine
+	}
+	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
 		log.Println("No monitoring needed - all EIPs properly configured")
 		return nil
 	}
@@ -3039,7 +3391,12 @@ func cmdAll() error {
 
 	// Create a temporary monitor just for the check
 	tempMonitor := &EIPMonitor{ocClient: ocClient}
-	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats) {
+	// Get overcommitted count for the check
+	overcommittedEIPs, err := ocClient.CountOvercommittedEIPObjects()
+	if err != nil {
+		overcommittedEIPs = 0 // Default to 0 if we can't determine
+	}
+	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
 		log.Println("No monitoring needed - pipeline complete")
 		return nil
 	}
