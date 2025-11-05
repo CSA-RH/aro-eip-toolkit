@@ -398,6 +398,261 @@ func (oc *OpenShiftClient) GetCPICStats() (*CPICStats, error) {
 	}, nil
 }
 
+type CNCCStats struct {
+	PodsRunning int
+	PodsReady   int
+	PodsTotal   int
+	QueueDepth  int // Work queue depth (if available via metrics)
+}
+
+func (oc *OpenShiftClient) GetCNCCStats() (*CNCCStats, error) {
+	// Get CNCC pods status
+	podData, err := oc.RunCommand([]string{"get", "pods", "-n", "openshift-cloud-network-config-controller", "-o", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get CNCC pods: %w", err)
+	}
+
+	items, ok := podData["items"].([]interface{})
+	if !ok {
+		return &CNCCStats{}, nil
+	}
+
+	running := 0
+	ready := 0
+	total := len(items)
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		phase, _ := status["phase"].(string)
+		if phase == "Running" {
+			running++
+		}
+
+		// Check if all containers are ready
+		conditions, ok := status["conditions"].([]interface{})
+		if ok {
+			allReady := true
+			for _, cond := range conditions {
+				condMap, ok := cond.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				typeStr, _ := condMap["type"].(string)
+				statusStr, _ := condMap["status"].(string)
+				if typeStr == "Ready" && statusStr != "True" {
+					allReady = false
+					break
+				}
+			}
+			if allReady && phase == "Running" {
+				ready++
+			}
+		}
+	}
+
+	// Try to get work queue depth from CNCC metrics (if available)
+	// This checks if CNCC exposes metrics endpoint with workqueue_depth metric
+	queueDepth := 0
+	// Note: Queue depth would typically come from Prometheus metrics
+	// For now, we'll check if we can infer from pod status or use a placeholder
+	// In a full implementation, you'd query the metrics endpoint: /metrics on CNCC pod
+
+	return &CNCCStats{
+		PodsRunning: running,
+		PodsReady:   ready,
+		PodsTotal:   total,
+		QueueDepth:  queueDepth,
+	}, nil
+}
+
+func (oc *OpenShiftClient) GetNodeCapacity(nodeName string) (int, error) {
+	// Get node annotations to check IP capacity (it's in annotations, not labels)
+	nodeData, err := oc.RunCommand([]string{"get", "node", nodeName, "-o", "json"})
+	if err != nil {
+		return 0, err
+	}
+
+	metadata, ok := nodeData["metadata"].(map[string]interface{})
+	if !ok {
+		return 0, fmt.Errorf("invalid metadata format")
+	}
+
+	// Get egress IP config from annotations
+	annotations, ok := metadata["annotations"].(map[string]interface{})
+	if !ok {
+		return 0, nil // No annotations, return 0 (unknown capacity)
+	}
+
+	egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
+	if !ok || egressIPConfig == "" {
+		return 0, nil // No egress IP config annotation
+	}
+
+	// Parse the annotation/label JSON to extract capacity
+	// The value is a JSON string like: [{"interface":"...","ifaddr":{"ipv4":"10.0.2.0/23"},"capacity":{"ip":255}}]
+	var configs []map[string]interface{}
+	if err := json.Unmarshal([]byte(egressIPConfig), &configs); err != nil {
+		return 0, nil // Failed to parse, return 0
+	}
+
+	// Sum up all capacities from all interfaces
+	totalCapacity := 0
+	for _, config := range configs {
+		capacity, ok := config["capacity"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		ip, ok := capacity["ip"].(float64)
+		if ok {
+			totalCapacity += int(ip)
+		}
+	}
+
+	return totalCapacity, nil
+}
+
+func (oc *OpenShiftClient) GetNodeStatus(nodeName string) (NodeStatus, error) {
+	// Get node to check status
+	nodeData, err := oc.RunCommand([]string{"get", "node", nodeName, "-o", "json"})
+	if err != nil {
+		return NodeStatusUnknown, err
+	}
+
+	// Check for unschedulable taint (SchedulingDisabled)
+	spec, ok := nodeData["spec"].(map[string]interface{})
+	if ok {
+		unschedulable, ok := spec["unschedulable"].(bool)
+		if ok && unschedulable {
+			return NodeStatusSchedulingDisabled, nil
+		}
+	}
+
+	// Check Ready condition
+	status, ok := nodeData["status"].(map[string]interface{})
+	if !ok {
+		return NodeStatusUnknown, nil
+	}
+
+	conditions, ok := status["conditions"].([]interface{})
+	if !ok {
+		return NodeStatusUnknown, nil
+	}
+
+	for _, cond := range conditions {
+		condMap, ok := cond.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		typeStr, _ := condMap["type"].(string)
+		if typeStr == "Ready" {
+			statusStr, _ := condMap["status"].(string)
+			if statusStr == "True" {
+				return NodeStatusReady, nil
+			} else {
+				return NodeStatusNotReady, nil
+			}
+		}
+	}
+
+	// If no Ready condition found, check if node is marked as unschedulable
+	// This could also mean the node is not ready
+	return NodeStatusNotReady, nil
+}
+
+// GetIPToNodeMapping builds a mapping of IP addresses to assigned nodes from CPIC objects
+// This is more accurate than relying on EIP status.items which may be incomplete
+func (oc *OpenShiftClient) GetIPToNodeMapping() (map[string]string, error) {
+	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, err
+	}
+
+	ipToNode := make(map[string]string)
+	items, ok := cpicData["items"].([]interface{})
+	if !ok {
+		return ipToNode, nil
+	}
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get the IP address
+		ipValue, ok := spec["ip"]
+		if !ok {
+			continue
+		}
+		ipStr := ""
+		switch v := ipValue.(type) {
+		case string:
+			ipStr = v
+		case nil:
+			continue
+		default:
+			ipStr = fmt.Sprintf("%v", v)
+		}
+		if ipStr == "" {
+			continue
+		}
+
+		// Get the node assignment
+		nodeValue, ok := spec["node"]
+		if !ok {
+			continue
+		}
+		nodeStr := ""
+		switch v := nodeValue.(type) {
+		case string:
+			nodeStr = v
+		case nil:
+			continue
+		default:
+			nodeStr = fmt.Sprintf("%v", v)
+		}
+		if nodeStr == "" {
+			continue
+		}
+
+		// Check if CPIC has CloudResponseSuccess status (assigned)
+		status, ok := itemMap["status"].(map[string]interface{})
+		if ok {
+			conditions, ok := status["conditions"].([]interface{})
+			if ok {
+				for _, cond := range conditions {
+					condMap, ok := cond.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					reason, _ := condMap["reason"].(string)
+					if reason == "CloudResponseSuccess" {
+						ipToNode[ipStr] = nodeStr
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return ipToNode, nil
+}
+
 func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	// Get CPIC stats for the node
 	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
@@ -418,7 +673,27 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 			}
 
 			spec, ok := itemMap["spec"].(map[string]interface{})
-			if !ok || spec["node"] != nodeName {
+			if !ok {
+				continue
+			}
+
+			// Compare node field - handle both string and interface{} types
+			nodeValue, ok := spec["node"]
+			if !ok {
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			if nodeStr != nodeName {
 				continue
 			}
 
@@ -486,7 +761,25 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 					continue
 				}
 
-				if statusItemMap["node"] == nodeName {
+				// Compare node field - handle both string and interface{} types
+				nodeValue, ok := statusItemMap["node"]
+				if !ok {
+					continue
+				}
+
+				// Convert to string for comparison (handles both string and other types)
+				var nodeStr string
+				switch v := nodeValue.(type) {
+				case string:
+					nodeStr = v
+				case nil:
+					continue
+				default:
+					// Try to convert other types to string
+					nodeStr = fmt.Sprintf("%v", v)
+				}
+
+				if nodeStr == nodeName {
 					eipAssigned++
 				}
 			}
@@ -595,6 +888,32 @@ func max(a, b int) int {
 	return b
 }
 
+// calculateSubnetSize calculates the number of IPs in a subnet from CIDR notation
+// e.g., "10.0.2.0/23" -> 512 IPs
+func calculateSubnetSize(cidr string) int {
+	parts := strings.Split(cidr, "/")
+	if len(parts) != 2 {
+		return 0
+	}
+
+	maskBits, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0
+	}
+
+	// Calculate 2^(32-maskBits) for IPv4
+	if maskBits < 0 || maskBits > 32 {
+		return 0
+	}
+
+	hostBits := 32 - maskBits
+	if hostBits >= 63 {
+		return 0 // Prevent overflow
+	}
+
+	return 1 << hostBits // 2^hostBits
+}
+
 // EIPMonitor handles monitoring operations
 type EIPMonitor struct {
 	outputDir      string
@@ -633,6 +952,15 @@ func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CP
 	return eipStats.Assigned != eipStats.Configured || cpicStats.Success != eipStats.Configured
 }
 
+type NodeStatus string
+
+const (
+	NodeStatusReady              NodeStatus = "Ready"
+	NodeStatusSchedulingDisabled NodeStatus = "SchedulingDisabled"
+	NodeStatusNotReady           NodeStatus = "NotReady"
+	NodeStatusUnknown            NodeStatus = "Unknown"
+)
+
 type NodeEIPData struct {
 	Node        string
 	EIPAssigned int
@@ -641,6 +969,8 @@ type NodeEIPData struct {
 	CPICSuccess int
 	CPICPending int
 	CPICError   int
+	Capacity    int        // IP capacity from node annotations
+	Status      NodeStatus // Node readiness status
 }
 
 func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData {
@@ -659,6 +989,20 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 	nodeStats.AzureEIPs = azureEIPs
 	nodeStats.AzureLBs = azureLBs
 
+	// Get node IP capacity
+	capacity, err := em.ocClient.GetNodeCapacity(node)
+	if err != nil {
+		log.Printf("Error getting capacity for node %s: %v", node, err)
+		capacity = 0 // Unknown capacity
+	}
+
+	// Get node status
+	nodeStatus, err := em.ocClient.GetNodeStatus(node)
+	if err != nil {
+		log.Printf("Error getting status for node %s: %v", node, err)
+		nodeStatus = NodeStatusUnknown
+	}
+
 	// Log node statistics
 	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_cpic", node), map[string]interface{}{
 		"success": nodeStats.CPICSuccess,
@@ -675,6 +1019,10 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 		"lbs":  nodeStats.AzureLBs,
 	})
 
+	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_capacity", node), map[string]interface{}{
+		"capacity": capacity,
+	})
+
 	// Don't log here - will log after sorting in MonitorLoop
 
 	return &NodeEIPData{
@@ -685,6 +1033,8 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 		CPICSuccess: nodeStats.CPICSuccess,
 		CPICPending: nodeStats.CPICPending,
 		CPICError:   nodeStats.CPICError,
+		Capacity:    capacity,
+		Status:      nodeStatus,
 	}
 }
 
@@ -790,9 +1140,22 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 	// Track previous summary stats for highlighting
 	var prevSummary struct {
-		configured, successful, assigned int
-		initialized                      bool
+		configured, successful, assigned, cpicError int
+		cnccRunning, cnccReady                      int
+		initialized                                 bool
 	}
+
+	// Track progress detection for OVN-Kube warning
+	var progressTracker struct {
+		iterationsWithoutProgress int
+		baselineSet               bool
+		baselineEIPAssigned       int
+		baselineCPICSuccess       int
+		baselineCPICPending       int
+		baselineNodeEIPs          map[string]int // node -> EIP assigned count
+		warningShown              bool           // Track if warning was already shown for current baseline
+	}
+	progressTracker.baselineNodeEIPs = make(map[string]int)
 
 	for {
 		timestamp := time.Now().Format(time.RFC3339)
@@ -806,6 +1169,14 @@ func (em *EIPMonitor) MonitorLoop() error {
 		cpicStats, err := em.ocClient.GetCPICStats()
 		if err != nil {
 			return err
+		}
+
+		// Get CNCC stats (pod health and queue depth)
+		cnccStats, err := em.ocClient.GetCNCCStats()
+		if err != nil {
+			// Log error but don't fail - CNCC stats are optional
+			fmt.Fprintf(os.Stderr, "Warning: Failed to get CNCC stats: %v\n", err)
+			cnccStats = &CNCCStats{} // Use empty stats
 		}
 
 		// Log global statistics
@@ -847,14 +1218,35 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Format values with highlighting if changed
 			cpicSuccessStr := formatValue(data.CPICSuccess, prev != nil && prev.CPICSuccess != data.CPICSuccess, isTerminal)
 			cpicPendingStr := formatValue(data.CPICPending, prev != nil && prev.CPICPending != data.CPICPending, isTerminal)
-			cpicErrorStr := formatValue(data.CPICError, prev != nil && prev.CPICError != data.CPICError, isTerminal)
+			// Use red highlighting for CPIC errors
+			cpicErrorStr := formatValueError(data.CPICError, prev != nil && prev.CPICError != data.CPICError, isTerminal)
 			eipStr := formatValue(data.EIPAssigned, prev != nil && prev.EIPAssigned != data.EIPAssigned, isTerminal)
 			azureEIPsStr := formatValue(data.AzureEIPs, prev != nil && prev.AzureEIPs != data.AzureEIPs, isTerminal)
 			azureLBsStr := formatValue(data.AzureLBs, prev != nil && prev.AzureLBs != data.AzureLBs, isTerminal)
 
-			fmt.Printf("%s%s - CPIC: %s/%s/%s, EIP: %s, Azure: %s/%s\n",
-				clearLine, data.Node, cpicSuccessStr, cpicPendingStr, cpicErrorStr,
-				eipStr, azureEIPsStr, azureLBsStr)
+			// Format capacity: show as "X/Y" where X is available capacity (total - assigned), Y is total capacity
+			// Always show capacity, even if unknown (show as "?")
+			capacityStr := ""
+			if data.Capacity > 0 {
+				availableCapacity := data.Capacity - data.EIPAssigned
+				if availableCapacity < 0 {
+					availableCapacity = 0 // Don't show negative
+				}
+				capacityChanged := prev != nil && (prev.Capacity != data.Capacity || prev.EIPAssigned != data.EIPAssigned)
+				capacityStr = fmt.Sprintf(", Capacity: %s/%d",
+					formatValue(availableCapacity, capacityChanged, isTerminal),
+					data.Capacity)
+			} else {
+				// Capacity unknown or 0, show as "?"
+				capacityStr = ", Capacity: ?/?"
+			}
+
+			// Format node name with color based on status
+			nodeNameStr := formatNodeName(data.Node, data.Status, isTerminal)
+
+			fmt.Printf("%s%s - CPIC: %s/%s/%s, EIP: %s, Azure: %s/%s%s\n",
+				clearLine, nodeNameStr, cpicSuccessStr, cpicPendingStr, cpicErrorStr,
+				eipStr, azureEIPsStr, azureLBsStr, capacityStr)
 
 			// Store current values for next iteration
 			if !hasPrev {
@@ -863,23 +1255,199 @@ func (em *EIPMonitor) MonitorLoop() error {
 			*prevValues[data.Node] = *data
 		}
 
+		// Calculate total cluster capacity from subnet CIDR
+		// Get subnet from first node's annotation (assuming all nodes share same subnet)
+		clusterCapacity := 0
+		if len(nodeData) > 0 {
+			firstNode := nodeData[0].Node
+			nodeDataRaw, err := em.ocClient.RunCommand([]string{"get", "node", firstNode, "-o", "json"})
+			if err == nil {
+				if metadata, ok := nodeDataRaw["metadata"].(map[string]interface{}); ok {
+					annotations, ok := metadata["annotations"].(map[string]interface{})
+					if ok {
+						egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
+						if ok && egressIPConfig != "" {
+							var configs []map[string]interface{}
+							if err := json.Unmarshal([]byte(egressIPConfig), &configs); err == nil {
+								for _, config := range configs {
+									if ifaddr, ok := config["ifaddr"].(map[string]interface{}); ok {
+										if ipv4, ok := ifaddr["ipv4"].(string); ok {
+											// Parse CIDR (e.g., "10.0.2.0/23")
+											clusterCapacity = calculateSubnetSize(ipv4)
+											break // Use first interface's subnet
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Calculate assigned EIPs by summing per-node counts (to ensure consistency)
+		assignedFromNodes := 0
+		for _, data := range nodeData {
+			assignedFromNodes += data.EIPAssigned
+		}
+
 		// Format summary stats with highlighting
 		configuredStr := formatValue(eipStats.Configured, prevSummary.initialized && prevSummary.configured != eipStats.Configured, isTerminal)
 		successfulStr := formatValue(cpicStats.Success, prevSummary.initialized && prevSummary.successful != cpicStats.Success, isTerminal)
-		assignedStr := formatValue(eipStats.Assigned, prevSummary.initialized && prevSummary.assigned != eipStats.Assigned, isTerminal)
+		assignedStr := formatValue(assignedFromNodes, prevSummary.initialized && prevSummary.assigned != assignedFromNodes, isTerminal)
 
-		fmt.Printf("%sConfigured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s\n",
-			clearLine, configuredStr, successfulStr, assignedStr)
+		// Format CNCC stats with highlighting
+		cnccRunningStr := formatValue(cnccStats.PodsRunning, prevSummary.initialized && prevSummary.cnccRunning != cnccStats.PodsRunning, isTerminal)
+		cnccReadyStr := formatValue(cnccStats.PodsReady, prevSummary.initialized && prevSummary.cnccReady != cnccStats.PodsReady, isTerminal)
+		cnccQueueStr := ""
+		if cnccStats.QueueDepth > 0 {
+			cnccQueueStr = fmt.Sprintf(", Queue: %d", cnccStats.QueueDepth)
+		}
 
-		// Store current summary for next iteration
+		// Format total capacity: show available/total (available = total - assigned)
+		// Use assignedFromNodes for consistency with displayed value
+		capacityStr := ""
+		if clusterCapacity > 0 {
+			availableCapacity := clusterCapacity - assignedFromNodes
+			if availableCapacity < 0 {
+				availableCapacity = 0 // Don't show negative
+			}
+			capacityStr = fmt.Sprintf(", Total Capacity: %d/%d", availableCapacity, clusterCapacity)
+		}
+
+		// Determine cluster summary color based on status
+		// Check progress status first (before it gets updated below)
+		noProgressDetected := false
+		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
+			noProgressDetected = true
+		}
+
+		summaryLabel := "Cluster Summary:"
+		if isTerminal {
+			if cpicStats.Error > 0 {
+				// Red if CPIC errors exist (same lighter red as CPIC error message)
+				summaryLabel = fmt.Sprintf("\033[31;1m%s\033[0m", summaryLabel)
+			} else if noProgressDetected {
+				// Yellow if no progress in 10 iterations
+				summaryLabel = fmt.Sprintf("\033[33m%s\033[0m", summaryLabel)
+			} else {
+				// Green if everything is OK
+				summaryLabel = fmt.Sprintf("\033[32m%s\033[0m", summaryLabel)
+			}
+		}
+
+		fmt.Printf("%s%s Configured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s, CNCC: %s/%s%s%s\n",
+			clearLine, summaryLabel, configuredStr, successfulStr, assignedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+
+		// Track if we need to display error/warning messages
+		hasErrorMessage := false
+
+		// Check for CPIC errors and display warning if errors are detected or increased
+		if cpicStats.Error > 0 {
+			// Always display error message when errors are present (so it persists on screen)
+			fmt.Printf("%s\033[31;1m⚠️  CPIC Error Detected: %d error(s) found. Please check CNCC logs in OpenShift: stern -n openshift-cloud-network-config-controller cloud-network-config-controller.\033[0m\n",
+				clearLine, cpicStats.Error)
+			hasErrorMessage = true
+			// Reset progress tracker when errors are present (we don't want to show OVN-Kube message)
+			progressTracker.iterationsWithoutProgress = 0
+			progressTracker.baselineSet = false
+			progressTracker.warningShown = false
+		} else {
+			// Check for progress in EIP assignment and CPIC status
+			if !progressTracker.baselineSet {
+				// Set baseline for progress tracking (use assignedFromNodes for consistency)
+				progressTracker.baselineEIPAssigned = assignedFromNodes
+				progressTracker.baselineCPICSuccess = cpicStats.Success
+				progressTracker.baselineCPICPending = cpicStats.Pending
+				for _, data := range nodeData {
+					progressTracker.baselineNodeEIPs[data.Node] = data.EIPAssigned
+				}
+				progressTracker.baselineSet = true
+				progressTracker.iterationsWithoutProgress = 0
+				progressTracker.warningShown = false
+			} else {
+				// Check if there's been any progress
+				progressMade := false
+
+				// Check EIP assignment progress (use assignedFromNodes for consistency)
+				if assignedFromNodes > progressTracker.baselineEIPAssigned {
+					progressMade = true
+				}
+
+				// Check CPIC success progress
+				if cpicStats.Success > progressTracker.baselineCPICSuccess {
+					progressMade = true
+				}
+
+				// Check CPIC pending reduction
+				if cpicStats.Pending < progressTracker.baselineCPICPending {
+					progressMade = true
+				}
+
+				// Check node-level EIP assignment progress
+				for _, data := range nodeData {
+					if baselineEIP, exists := progressTracker.baselineNodeEIPs[data.Node]; exists {
+						if data.EIPAssigned > baselineEIP {
+							progressMade = true
+							break
+						}
+					} else {
+						// New node detected, count as progress
+						progressMade = true
+						break
+					}
+				}
+
+				if progressMade {
+					// Progress detected, reset counter and update baseline (use assignedFromNodes for consistency)
+					progressTracker.iterationsWithoutProgress = 0
+					progressTracker.warningShown = false
+					progressTracker.baselineEIPAssigned = assignedFromNodes
+					progressTracker.baselineCPICSuccess = cpicStats.Success
+					progressTracker.baselineCPICPending = cpicStats.Pending
+					for _, data := range nodeData {
+						progressTracker.baselineNodeEIPs[data.Node] = data.EIPAssigned
+					}
+				} else {
+					// No progress, increment counter
+					progressTracker.iterationsWithoutProgress++
+
+					// If 10 iterations without progress and no CPIC errors, show OVN-Kube warning (once per baseline)
+					if progressTracker.iterationsWithoutProgress >= 10 && !progressTracker.warningShown {
+						// Print warning as part of the overwritable output block
+						fmt.Printf("%s\033[33;1m⚠️  No progress detected in 10 iterations. Please check OVN-Kube logs and restart pods in openshift-ovn-kubernetes namespace:\033[0m\n",
+							clearLine)
+						fmt.Printf("%s   stern -n openshift-ovn-kubernetes ovnkube-control-plane.\n", clearLine)
+						fmt.Printf("%s   stern -n openshift-ovn-kubernetes ovnkube-node.\n", clearLine)
+						fmt.Printf("%s   oc delete pods -n openshift-ovn-kubernetes -l app=ovnkube-control-plane\n", clearLine)
+						fmt.Printf("%s   oc delete pods -n openshift-ovn-kubernetes -l app=ovnkube-node\n", clearLine)
+						hasErrorMessage = true
+						progressTracker.warningShown = true
+					}
+				}
+			}
+		}
+
+		// Store current summary for next iteration (use assignedFromNodes for consistency)
 		prevSummary.configured = eipStats.Configured
 		prevSummary.successful = cpicStats.Success
-		prevSummary.assigned = eipStats.Assigned
+		prevSummary.assigned = assignedFromNodes
+		prevSummary.cpicError = cpicStats.Error
+		prevSummary.cnccRunning = cnccStats.PodsRunning
+		prevSummary.cnccReady = cnccStats.PodsReady
 		prevSummary.initialized = true
 
-		// Update count of lines printed (timestamp + nodes + 1 summary line)
+		// Update count of lines printed (timestamp + nodes + 1 summary line + optional error message)
 		// After printing N lines with \n, cursor is on line N+1 (blank line)
-		linesPrinted = 1 + len(nodeData) + 1
+		linesPrinted = 1 + len(nodeData) + 1 // timestamp + nodes + summary
+		if hasErrorMessage {
+			// Add lines for error/warning messages (CPIC error = 1 line, OVN-Kube warning = 5 lines)
+			if cpicStats.Error > 0 {
+				linesPrinted += 1 // CPIC error message
+			} else if progressTracker.iterationsWithoutProgress >= 10 && progressTracker.warningShown {
+				linesPrinted += 5 // OVN-Kube warning (5 lines: header + 4 commands)
+			}
+		}
 
 		// Flush stdout to ensure output is displayed immediately
 		os.Stdout.Sync()
@@ -914,6 +1482,43 @@ func formatValue(value int, changed bool, isTerminal bool) string {
 	}
 	// Use yellow/bright yellow for changed values
 	return fmt.Sprintf("\033[33;1m%d\033[0m", value) // Yellow, bold
+}
+
+// formatValueError formats a value with red highlighting if it changed (for errors)
+func formatValueError(value int, changed bool, isTerminal bool) string {
+	if !isTerminal {
+		return fmt.Sprintf("%d", value)
+	}
+	// Always highlight errors in red if they exist, or red if changed
+	if value > 0 {
+		if changed {
+			return fmt.Sprintf("\033[31;1m%d\033[0m", value) // Red, bold (changed)
+		}
+		return fmt.Sprintf("\033[31m%d\033[0m", value) // Red (existing)
+	}
+	// If value is 0 and changed (decreased), show normally
+	if changed {
+		return fmt.Sprintf("\033[32;1m%d\033[0m", value) // Green, bold (error resolved)
+	}
+	return fmt.Sprintf("%d", value)
+}
+
+// formatNodeName formats a node name with color based on status
+func formatNodeName(nodeName string, status NodeStatus, isTerminal bool) string {
+	if !isTerminal {
+		return nodeName
+	}
+
+	switch status {
+	case NodeStatusReady:
+		return fmt.Sprintf("\033[32m%s\033[0m", nodeName) // Green
+	case NodeStatusSchedulingDisabled:
+		return fmt.Sprintf("\033[33m%s\033[0m", nodeName) // Yellow
+	case NodeStatusNotReady:
+		return fmt.Sprintf("\033[31m%s\033[0m", nodeName) // Red
+	default:
+		return nodeName // Unknown status, no color
+	}
 }
 
 // DataProcessor handles log merging
