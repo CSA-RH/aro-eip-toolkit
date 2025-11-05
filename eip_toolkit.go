@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"image/color"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -257,6 +258,157 @@ func (oc *OpenShiftClient) RunCommand(cmd []string) (map[string]interface{}, err
 	return result, nil
 }
 
+// FetchEIPAndCPICData fetches both EIP and CPIC data in a single operation
+// This reduces API calls when both are needed together
+func (oc *OpenShiftClient) FetchEIPAndCPICData() (map[string]interface{}, map[string]interface{}, error) {
+	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get EIP data: %w", err)
+	}
+
+	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get CPIC data: %w", err)
+	}
+
+	return eipData, cpicData, nil
+}
+
+// GetEIPStatsFromData computes EIP stats from pre-fetched data
+func (oc *OpenShiftClient) GetEIPStatsFromData(eipData map[string]interface{}) (*EIPStats, error) {
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid items format")
+	}
+
+	// Count configured EIPs: sum up the number of IPs in spec.egressIPs for each EIP resource
+	// Each EIP resource can have multiple IPs configured (e.g., 2 IPs per namespace)
+	configured := 0
+	assigned := 0
+	unassigned := 0
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Count IPs in spec.egressIPs (each EIP resource can have multiple IPs)
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				configured += len(egressIPs)
+			}
+		}
+
+		// Count assigned IPs from status.items (only count items with node assigned)
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		statusItems, ok := status["items"].([]interface{})
+		if ok {
+			// Only count items that have a node assigned (actually assigned)
+			for _, statusItem := range statusItems {
+				statusItemMap, ok := statusItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				nodeValue, hasNode := statusItemMap["node"]
+				if hasNode && nodeValue != nil {
+					assigned++
+				}
+			}
+		}
+	}
+
+	unassigned = configured - assigned
+
+	return &EIPStats{
+		Configured: configured,
+		Assigned:   assigned,
+		Unassigned: unassigned,
+	}, nil
+}
+
+// GetCPICStatsFromData computes CPIC stats from pre-fetched data
+func (oc *OpenShiftClient) GetCPICStatsFromData(cpicData map[string]interface{}) (*CPICStats, error) {
+	items, ok := cpicData["items"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid items format")
+	}
+
+	success := 0
+	pending := 0
+	errorCount := 0
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		conditions, ok := status["conditions"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, cond := range conditions {
+			condMap, ok := cond.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			reason, ok := condMap["reason"].(string)
+			if !ok {
+				continue
+			}
+
+			switch reason {
+			case "CloudResponseSuccess":
+				success++
+			case "CloudResponsePending":
+				pending++
+			case "CloudResponseError":
+				errorCount++
+			}
+		}
+	}
+
+	return &CPICStats{
+		Success: success,
+		Pending: pending,
+		Error:   errorCount,
+	}, nil
+}
+
+// VerifySystemAdminAccess checks if the current user has system:admin or cluster-admin access
+func (oc *OpenShiftClient) VerifySystemAdminAccess() error {
+	// Try to check if we can access cluster-admin resources
+	// Using 'oc auth can-i' to check for cluster-admin permissions
+	cmd := exec.Command("oc", "auth", "can-i", "*", "*", "--all-namespaces")
+	output, err := cmd.Output()
+	if err != nil {
+		if exitError, ok := err.(*exec.ExitError); ok {
+			return &EIPToolkitError{Message: fmt.Sprintf("System:admin access verification failed: %s\nPlease ensure you are logged in as system:admin or have cluster-admin privileges", string(exitError.Stderr))}
+		}
+		return &EIPToolkitError{Message: fmt.Sprintf("System:admin access verification failed: %v\nPlease ensure you are logged in as system:admin or have cluster-admin privileges", err)}
+	}
+
+	result := strings.TrimSpace(string(output))
+	if result != "yes" {
+		return &EIPToolkitError{Message: "System:admin access verification failed: insufficient permissions\nPlease ensure you are logged in as system:admin or have cluster-admin privileges"}
+	}
+
+	return nil
+}
+
 func (oc *OpenShiftClient) GetEIPEnabledNodes() ([]string, error) {
 	cmd := exec.Command("oc", "get", "nodes", "-l", "k8s.ovn.org/egress-assignable=true", "-o", "name")
 	output, err := cmd.Output()
@@ -293,6 +445,11 @@ func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
 		return nil, err
 	}
 
+	return oc.GetEIPStatsFromData(data)
+}
+
+// GetEIPStatsInternal is kept for backward compatibility but delegates to GetEIPStatsFromData
+func (oc *OpenShiftClient) getEIPStatsInternal(data map[string]interface{}) (*EIPStats, error) {
 	items, ok := data["items"].([]interface{})
 	if !ok {
 		return nil, fmt.Errorf("invalid items format")
@@ -355,58 +512,7 @@ func (oc *OpenShiftClient) GetCPICStats() (*CPICStats, error) {
 		return nil, err
 	}
 
-	items, ok := data["items"].([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("invalid items format")
-	}
-
-	success := 0
-	pending := 0
-	errorCount := 0
-
-	for _, item := range items {
-		itemMap, ok := item.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		status, ok := itemMap["status"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		conditions, ok := status["conditions"].([]interface{})
-		if !ok {
-			continue
-		}
-
-		for _, cond := range conditions {
-			condMap, ok := cond.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			reason, ok := condMap["reason"].(string)
-			if !ok {
-				continue
-			}
-
-			switch reason {
-			case "CloudResponseSuccess":
-				success++
-			case "CloudResponsePending":
-				pending++
-			case "CloudResponseError":
-				errorCount++
-			}
-		}
-	}
-
-	return &CPICStats{
-		Success: success,
-		Pending: pending,
-		Error:   errorCount,
-	}, nil
+	return oc.GetCPICStatsFromData(data)
 }
 
 type CNCCStats struct {
@@ -588,6 +694,11 @@ func (oc *OpenShiftClient) GetIPToNodeMapping() (map[string]string, error) {
 		return nil, err
 	}
 
+	return oc.getIPToNodeMappingFromData(cpicData)
+}
+
+// getIPToNodeMappingFromData builds IP->node mapping from pre-fetched CPIC data
+func (oc *OpenShiftClient) getIPToNodeMappingFromData(cpicData map[string]interface{}) (map[string]string, error) {
 	ipToNode := make(map[string]string)
 	items, ok := cpicData["items"].([]interface{})
 	if !ok {
@@ -695,6 +806,21 @@ type UnassignedEIP struct {
 // Returns a list of mismatches where the same IP is assigned to different nodes
 // Accounts for the constraint that only one IP can be assigned per node (to avoid false positives)
 func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) {
+	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get EIP data: %w", err)
+	}
+
+	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get CPIC data: %w", err)
+	}
+
+	return oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+}
+
+// DetectEIPCPICMismatchesWithData performs mismatch detection using pre-fetched data
+func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map[string]interface{}) ([]EIPCPICMismatch, error) {
 	var mismatches []EIPCPICMismatch
 
 	// Get count of available nodes (nodes with egress-assignable label)
@@ -705,16 +831,10 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 		availableNodeCount = len(availableNodes)
 	}
 
-	// Get CPIC IP->node mapping (already exists)
-	cpicIPToNode, err := oc.GetIPToNodeMapping()
+	// Get CPIC IP->node mapping from provided data
+	cpicIPToNode, err := oc.getIPToNodeMappingFromData(cpicData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CPIC IP to node mapping: %w", err)
-	}
-
-	// Get EIP data and build EIP IP->node mapping
-	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get EIP data: %w", err)
 	}
 
 	// Build EIP IP->node mapping
@@ -1185,7 +1305,21 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) 
 
 // CountOvercommittedEIPObjects counts EIP objects (resources) that have more IPs configured than available nodes
 // An EIP resource is overcommitted if configured IPs > number of nodes with egress-assignable label
-func (oc *OpenShiftClient) CountOvercommittedEIPObjects() (int, error) {
+// If eipData is provided, it will be used instead of fetching again
+func (oc *OpenShiftClient) CountOvercommittedEIPObjects(eipData ...map[string]interface{}) (int, error) {
+	var data map[string]interface{}
+	var err error
+
+	if len(eipData) > 0 && eipData[0] != nil {
+		data = eipData[0]
+	} else {
+		// Get EIP data if not provided
+		data, err = oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+		if err != nil {
+			return 0, fmt.Errorf("failed to get EIP data: %w", err)
+		}
+	}
+
 	// Get count of available nodes
 	availableNodes, err := oc.GetEIPEnabledNodes()
 	availableNodeCount := 0
@@ -1197,13 +1331,7 @@ func (oc *OpenShiftClient) CountOvercommittedEIPObjects() (int, error) {
 		return 0, nil // No nodes available, can't determine overcommitment
 	}
 
-	// Get EIP data
-	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
-	if err != nil {
-		return 0, fmt.Errorf("failed to get EIP data: %w", err)
-	}
-
-	items, ok := eipData["items"].([]interface{})
+	items, ok := data["items"].([]interface{})
 	if !ok {
 		return 0, nil
 	}
@@ -1237,8 +1365,9 @@ func (oc *OpenShiftClient) CountOvercommittedEIPObjects() (int, error) {
 
 // CountMalfunctioningEIPObjects counts EIP objects (resources) that have mismatches between their status.items and CPIC
 // An EIP object is malfunctioning if any of its IPs in status.items don't match CPIC assignments
-func (oc *OpenShiftClient) CountMalfunctioningEIPObjects() (int, error) {
-	mismatches, err := oc.DetectEIPCPICMismatches()
+// If eipData and cpicData are provided, they will be used instead of fetching again
+func (oc *OpenShiftClient) CountMalfunctioningEIPObjects(eipData, cpicData map[string]interface{}) (int, error) {
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
 	if err != nil {
 		return 0, err
 	}
@@ -2069,12 +2198,13 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor
 	}, nil
 }
 
-func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats, overcommittedEIPs int) bool {
+func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats, overcommittedEIPs int, totalAzureEIPs int) bool {
 	// Stats are already printed in MonitorLoop, no need to log here
 
 	// If there are overcommitted EIPs, calculate expected assignable IPs
 	// Overcommitted resources have more IPs configured than available nodes
 	// Those extra IPs cannot be assigned, so we need to account for them
+	// Note: eipStats.Configured represents requested IPs (total number of IPs requested)
 	expectedAssignable := eipStats.Configured
 
 	if overcommittedEIPs > 0 {
@@ -2122,8 +2252,11 @@ func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CP
 
 	// Continue monitoring if:
 	// 1. Assigned IPs don't match expected assignable (accounting for overcommitment), OR
-	// 2. CPIC success doesn't match expected assignable
-	return eipStats.Assigned != expectedAssignable || cpicStats.Success != expectedAssignable
+	// 2. CPIC success doesn't match expected assignable, OR
+	// 3. Azure EIPs are not at 0 AND not equal to successful CPIC count
+	eipComplete := eipStats.Assigned == expectedAssignable && cpicStats.Success == expectedAssignable
+	azureComplete := totalAzureEIPs == 0 || totalAzureEIPs == cpicStats.Success
+	return !eipComplete || !azureComplete
 }
 
 type NodeStatus string
@@ -2259,11 +2392,13 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 	totalSecondaryEIPs := 0
 	totalAssignedEIPs := 0
 	totalAzureEIPs := 0
+	totalAzureLBs := 0
 	for _, data := range nodeData {
 		totalPrimaryEIPs += data.EIPAssigned
 		totalSecondaryEIPs += data.SecondaryEIPs
 		totalAssignedEIPs += data.EIPAssigned + data.SecondaryEIPs
 		totalAzureEIPs += data.AzureEIPs
+		totalAzureLBs += data.AzureLBs
 	}
 
 	nodeCount := len(nodeData)
@@ -2277,6 +2412,7 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 		"total_secondary_eips": totalSecondaryEIPs,
 		"total_assigned_eips":  totalAssignedEIPs,
 		"total_azure_eips":     totalAzureEIPs,
+		"total_azure_lbs":      totalAzureLBs,
 		"node_count":           nodeCount,
 		"avg_eips_per_node":    avgEIPs,
 	})
@@ -2318,15 +2454,18 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 	// Track number of lines we've printed (for overwriting)
 	linesPrinted := 0
+	prevLinesPrinted := 0              // Track previous iteration's line count for cursor movement
+	prevMismatchCount := 0             // Track previous iteration's mismatch count to detect when mismatches are resolved
+	prevIterationsWithoutProgress := 0 // Track previous iteration's progress state
 
 	// Track previous values for highlighting changes
 	prevValues := make(map[string]*NodeEIPData)
 
 	// Track previous summary stats for highlighting
 	var prevSummary struct {
-		configured, successful, assigned, cpicError int
-		cnccRunning, cnccReady                      int
-		initialized                                 bool
+		configured, requested, successful, assigned, cpicError int
+		cnccRunning, cnccReady                                 int
+		initialized                                            bool
 	}
 
 	// Track progress detection for OVN-Kube warning
@@ -2346,13 +2485,19 @@ func (em *EIPMonitor) MonitorLoop() error {
 		iterationCount++
 		timestamp := time.Now().Format(time.RFC3339)
 
-		// Get global statistics once per iteration
-		eipStats, err := em.ocClient.GetEIPStats()
+		// Fetch EIP and CPIC data once per iteration (reduces API calls)
+		eipData, cpicData, err := em.ocClient.FetchEIPAndCPICData()
 		if err != nil {
 			return err
 		}
 
-		cpicStats, err := em.ocClient.GetCPICStats()
+		// Compute stats from pre-fetched data
+		eipStats, err := em.ocClient.GetEIPStatsFromData(eipData)
+		if err != nil {
+			return err
+		}
+
+		cpicStats, err := em.ocClient.GetCPICStatsFromData(cpicData)
 		if err != nil {
 			return err
 		}
@@ -2365,25 +2510,33 @@ func (em *EIPMonitor) MonitorLoop() error {
 			cnccStats = &CNCCStats{} // Use empty stats
 		}
 
-		// Get malfunctioning EIP objects count
-		malfunctioningEIPs, err := em.ocClient.CountMalfunctioningEIPObjects()
+		// Get malfunctioning EIP objects count (using pre-fetched data)
+		malfunctioningEIPs, err := em.ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
 		if err != nil {
 			// Log error but don't fail - malfunctioning count is optional
 			fmt.Fprintf(os.Stderr, "Warning: Failed to count malfunctioning EIP objects: %v\n", err)
 			malfunctioningEIPs = 0
 		}
 
-		// Get overcommitted EIP objects count
-		overcommittedEIPs, err := em.ocClient.CountOvercommittedEIPObjects()
+		// Get overcommitted EIP objects count (using pre-fetched data)
+		overcommittedEIPs, err := em.ocClient.CountOvercommittedEIPObjects(eipData)
 		if err != nil {
 			// Log error but don't fail - overcommitted count is optional
 			fmt.Fprintf(os.Stderr, "Warning: Failed to count overcommitted EIP objects: %v\n", err)
 			overcommittedEIPs = 0
 		}
 
+		// Get EIP resource count (number of EIP objects) from pre-fetched data
+		eipResourceCount := 0
+		if items, ok := eipData["items"].([]interface{}); ok {
+			eipResourceCount = len(items)
+		}
+
 		// Log global statistics
+		// Note: "configured" = number of EIP objects, "requested" = total number of IPs
 		em.bufferedLogger.LogStats(timestamp, "ocp_eips", map[string]interface{}{
-			"configured": eipStats.Configured,
+			"configured": eipResourceCount,    // Number of EIP objects (resources)
+			"requested":  eipStats.Configured, // Total number of requested IPs
 			"assigned":   eipStats.Assigned,
 			"unassigned": eipStats.Unassigned,
 		})
@@ -2409,8 +2562,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
 
 		// Move cursor up to overwrite previous lines (if any)
-		if linesPrinted > 0 && isTerminal {
-			fmt.Printf("\033[%dA", linesPrinted) // Move up N lines to get back to first line
+		// Use prevLinesPrinted (from previous iteration) to move up
+		if prevLinesPrinted > 0 && isTerminal {
+			fmt.Printf("\033[%dA", prevLinesPrinted) // Move up N lines to get back to first line
 		}
 
 		// Print timestamp for this iteration
@@ -2420,6 +2574,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			clearLine = "\033[K"
 		}
 		fmt.Printf("%s%s\n", clearLine, timestampStr)
+
+		// Check progress status first (before node output, so we can use it for node coloring)
+		noProgressDetected := false
+		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
+			noProgressDetected = true
+		}
 
 		// Print node statistics in sorted order (using \033[K to clear line if terminal)
 		for _, data := range nodeData {
@@ -2456,9 +2616,34 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Format node name with color based on status
 			nodeNameStr := formatNodeName(data.Node, data.Status, isTerminal)
 
-			fmt.Printf("%s%s - CPIC: %s/%s/%s, Primary EIPs: %s, Secondary EIPs: %s, Azure: %s/%s%s\n",
-				clearLine, nodeNameStr, cpicSuccessStr, cpicPendingStr, cpicErrorStr,
-				eipStr, secondaryEIPStr, azureEIPsStr, azureLBsStr, capacityStr)
+			// Format Assigned EIP as x/y where x is primary and y is secondary
+			assignedEIPStr := fmt.Sprintf("%s/%s", eipStr, secondaryEIPStr)
+
+			// Check if no progress detected and the three values (CPIC Success, Total Assigned EIPs, Azure IPs) don't match
+			totalAssignedEIPs := data.EIPAssigned + data.SecondaryEIPs
+			shouldHighlightYellow := noProgressDetected && isTerminal &&
+				!(data.CPICSuccess == totalAssignedEIPs && totalAssignedEIPs == data.AzureEIPs)
+
+			// Build the output string (everything after node name)
+			outputStr := fmt.Sprintf(" - CPIC: %s/%s/%s, Assigned EIP: %s, Azure: %s/%s%s",
+				cpicSuccessStr, cpicPendingStr, cpicErrorStr,
+				assignedEIPStr, azureEIPsStr, azureLBsStr, capacityStr)
+
+			// Apply yellow color to output (excluding node name) if conditions are met
+			if shouldHighlightYellow {
+				outputStr = fmt.Sprintf("\033[33m%s\033[0m", outputStr)
+			}
+
+			fmt.Printf("%s%s%s\n",
+				clearLine, nodeNameStr, outputStr)
+
+			// Log status changes
+			if hasPrev && prev.Status != data.Status {
+				// Status changed - log the event
+				em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_status_event", data.Node), map[string]interface{}{
+					"event": fmt.Sprintf("status_change:%s:%s", prev.Status, data.Status),
+				})
+			}
 
 			// Store current values for next iteration
 			if !hasPrev {
@@ -2505,25 +2690,39 @@ func (em *EIPMonitor) MonitorLoop() error {
 			totalAssignedEIPs += data.EIPAssigned + data.SecondaryEIPs
 			totalPrimaryEIPs += data.EIPAssigned
 		}
+		totalSecondaryEIPs := totalAssignedEIPs - totalPrimaryEIPs
 
 		// Validation: Sum of Primary EIPs across nodes should not exceed number of unique EIP resources
 		// (A resource can be counted on multiple nodes if it has IPs on multiple nodes, but this is a sanity check)
-		// Get unique EIP resource count for validation
-		eipResourceCount := 0
-		if eipData, err := em.ocClient.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"}); err == nil {
-			if items, ok := eipData["items"].([]interface{}); ok {
-				eipResourceCount = len(items)
-			}
-		}
+		// Get unique EIP resource count (number of EIP objects) - reuse the one already calculated above
 		// Log warning if sum exceeds resource count (might indicate a bug, or legitimate multi-node resource distribution)
 		if totalPrimaryEIPs > eipResourceCount && eipResourceCount > 0 {
 			log.Printf("Warning: Sum of Primary EIPs (%d) exceeds unique EIP resource count (%d). This may indicate double-counting or legitimate multi-node resource distribution.", totalPrimaryEIPs, eipResourceCount)
 		}
 
+		// Log EIP resource count (number of EIP objects) separately
+		em.bufferedLogger.LogStats(timestamp, "ocp_eips_configured", map[string]interface{}{
+			"value": eipResourceCount,
+		})
+
+		// Log requested IPs (total number of IPs)
+		em.bufferedLogger.LogStats(timestamp, "ocp_eips_requested", map[string]interface{}{
+			"value": eipStats.Configured,
+		})
+
 		// Format summary stats with highlighting
-		configuredStr := formatValue(eipStats.Configured, prevSummary.initialized && prevSummary.configured != eipStats.Configured, isTerminal)
+		// Configured EIPs = number of EIP objects (resources)
+		// Requested EIPs = total number of IPs configured (eipStats.Configured)
+		configuredStr := formatValue(eipResourceCount, prevSummary.initialized && prevSummary.configured != eipResourceCount, isTerminal)
+		// For requested EIPs, check if it changed from the stored requested count
+		// We'll track requested separately in prevSummary, but for now use configured field as a proxy
+		requestedStr := formatValue(eipStats.Configured, prevSummary.initialized && prevSummary.requested != eipStats.Configured, isTerminal)
 		successfulStr := formatValue(cpicStats.Success, prevSummary.initialized && prevSummary.successful != cpicStats.Success, isTerminal)
-		assignedStr := formatValue(totalAssignedEIPs, prevSummary.initialized && prevSummary.assigned != totalAssignedEIPs, isTerminal)
+		// Format Assigned EIP as x/y where x is primary and y is secondary
+		primaryEIPChanged := prevSummary.initialized && prevSummary.assigned != totalAssignedEIPs
+		primaryEIPStr := formatValue(totalPrimaryEIPs, primaryEIPChanged, isTerminal)
+		secondaryEIPStr := formatValue(totalSecondaryEIPs, primaryEIPChanged, isTerminal)
+		assignedStr := fmt.Sprintf("%s/%s", primaryEIPStr, secondaryEIPStr)
 
 		// Format malfunctioning EIPs - red if > 0
 		malfunctionStr := fmt.Sprintf("%d", malfunctioningEIPs)
@@ -2557,12 +2756,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 		}
 
 		// Determine cluster summary color based on status
-		// Check progress status first (before it gets updated below)
-		noProgressDetected := false
-		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
-			noProgressDetected = true
-		}
-
+		// (noProgressDetected already calculated earlier before node output)
 		summaryLabel := "Cluster Summary:"
 		if isTerminal {
 			if cpicStats.Error > 0 {
@@ -2577,8 +2771,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		fmt.Printf("%s%s Configured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
-			clearLine, summaryLabel, configuredStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+		fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+			clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 
 		// Track if we need to display error/warning messages
 		hasErrorMessage := false
@@ -2629,25 +2823,29 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 					// Show detailed IPs
 					if progressTracker.iterationsWithoutProgress > 0 {
-						// Collect and format IPs for display (limit to first 20 for readability)
+						// Collect and format IPs for display (limit to first 10 for readability)
 						type ipDisplay struct {
 							ip      string
 							display string
 						}
 						var nodeMismatchIPs []ipDisplay
 						var missingInEIPIPs []ipDisplay
-						maxDisplay := 20
+						maxDisplay := 10
+
+						// Track IPs we've already added to prevent duplicates
+						addedIPs := make(map[string]bool)
 
 						for _, m := range mismatches {
 							if m.MismatchType == "node_mismatch" {
-								if len(nodeMismatchIPs) < maxDisplay {
+								if len(nodeMismatchIPs) < maxDisplay && !addedIPs[m.IP] {
 									nodeMismatchIPs = append(nodeMismatchIPs, ipDisplay{
 										ip:      m.IP,
 										display: fmt.Sprintf("%s (EIP: %s, CPIC: %s)", m.IP, m.EIPNode, m.CPICNode),
 									})
+									addedIPs[m.IP] = true
 								}
 							} else if m.MismatchType == "missing_in_eip" {
-								if len(missingInEIPIPs) < maxDisplay {
+								if len(missingInEIPIPs) < maxDisplay && !addedIPs[m.IP] {
 									var display string
 									if m.EIPResource != "" {
 										display = fmt.Sprintf("%s (%s → %s)", m.IP, m.EIPResource, m.CPICNode)
@@ -2658,6 +2856,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 										ip:      m.IP,
 										display: display,
 									})
+									addedIPs[m.IP] = true
 								}
 							}
 						}
@@ -2673,8 +2872,15 @@ func (em *EIPMonitor) MonitorLoop() error {
 						// Display detailed IPs in a readable format
 						if len(nodeMismatchIPs) > 0 {
 							displayCount := len(nodeMismatchIPs)
-							if nodeMismatches > maxDisplay {
-								fmt.Printf("%s   Node mismatches (%d shown of %d):\n", clearLine, displayCount, nodeMismatches)
+							// Count actual node mismatches for comparison
+							actualNodeMismatches := 0
+							for _, m := range mismatches {
+								if m.MismatchType == "node_mismatch" {
+									actualNodeMismatches++
+								}
+							}
+							if actualNodeMismatches > maxDisplay {
+								fmt.Printf("%s   Node mismatches (%d shown of %d):\n", clearLine, displayCount, actualNodeMismatches)
 							} else {
 								fmt.Printf("%s   Node mismatches:\n", clearLine)
 							}
@@ -2685,8 +2891,15 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 						if len(missingInEIPIPs) > 0 {
 							displayCount := len(missingInEIPIPs)
-							if missingInEIP > maxDisplay {
-								fmt.Printf("%s   Missing in EIP (%d shown of %d):\n", clearLine, displayCount, missingInEIP)
+							// Count actual missing in EIP for comparison
+							actualMissingInEIP := 0
+							for _, m := range mismatches {
+								if m.MismatchType == "missing_in_eip" {
+									actualMissingInEIP++
+								}
+							}
+							if actualMissingInEIP > maxDisplay {
+								fmt.Printf("%s   Missing in EIP (%d shown of %d):\n", clearLine, displayCount, actualMissingInEIP)
 							} else {
 								fmt.Printf("%s   Missing in EIP:\n", clearLine)
 							}
@@ -2694,6 +2907,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 								fmt.Printf("%s   - %s\n", clearLine, item.display)
 							}
 						}
+
+						// Flush stdout immediately after printing mismatch list to ensure it's fully written
+						// This prevents the list from being cut off or overwritten by cursor movement
+						os.Stdout.Sync()
 					}
 
 					hasErrorMessage = true
@@ -2702,8 +2919,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 		}
 
 		// Check for unassigned EIPs only after 10 iterations without progress
-		// Calculate actual unassigned: Configured - Assigned (where Assigned = CPIC Success = totalAssignedEIPs)
+		// Calculate actual unassigned: Requested - Assigned (where Requested = eipStats.Configured, Assigned = CPIC Success = totalAssignedEIPs)
 		// Skip unassigned detection if we already have mismatches (to avoid duplicate reporting)
+		// Note: eipStats.Configured represents requested IPs (total number of IPs requested)
 		actualUnassigned := eipStats.Configured - totalAssignedEIPs
 		if actualUnassigned > 0 && progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 && mismatchCount == 0 {
 			unassignedEIPs, err := em.ocClient.DetectUnassignedEIPs()
@@ -2730,7 +2948,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 						}
 					}
 
-					// Use actualUnassigned (Configured - totalAssignedEIPs) as the count
+					// Use actualUnassigned (Requested - totalAssignedEIPs) as the count
 					fmt.Printf("%s\033[33;1m⚠️  Unassigned EIPs: %d IP(s) - %s\033[0m\n",
 						clearLine, actualUnassigned, strings.Join(parts, ", "))
 					hasErrorMessage = true
@@ -2824,8 +3042,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		// Store current summary for next iteration (use totalAssignedEIPs for consistency)
-		prevSummary.configured = eipStats.Configured
+		// Store current summary for next iteration
+		prevSummary.configured = eipResourceCount   // Number of EIP objects
+		prevSummary.requested = eipStats.Configured // Total requested IPs
 		prevSummary.successful = cpicStats.Success
 		prevSummary.assigned = totalAssignedEIPs
 		prevSummary.cpicError = cpicStats.Error
@@ -2841,32 +3060,48 @@ func (em *EIPMonitor) MonitorLoop() error {
 			if mismatchCount > 0 {
 				linesPrinted += 1 // EIP/CPIC mismatch summary (1 line)
 				// Add lines for detailed IP display if shown (after 10 iterations without progress)
-				if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
-					// Count how many detailed lines will be printed
-					nodeMismatches := 0
-					missingInEIP := 0
+				// This condition must match the display condition exactly (line 2802)
+				// The display happens inside the block that checks >= 10, so we check the same here
+				if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 && len(mismatches) > 0 {
+					// Count how many detailed lines will be printed (must match what's actually displayed)
+					// This must exactly replicate the logic in lines 2808-2881
+					maxDisplay := 10 // Must match the limit used in display code above
+
+					// Replicate the collection logic from lines 2808-2834
+					// Count mismatches by type and collect up to maxDisplay of each
+					nodeMismatchCount := 0
+					missingInEIPCount := 0
+
+					// Count total mismatches by type
 					for _, m := range mismatches {
 						if m.MismatchType == "node_mismatch" {
-							nodeMismatches++
+							nodeMismatchCount++
 						} else if m.MismatchType == "missing_in_eip" {
-							missingInEIP++
+							missingInEIPCount++
 						}
 					}
-					if nodeMismatches > 0 {
-						linesPrinted += 1 // Header line
-						displayCount := nodeMismatches
-						if displayCount > 20 {
-							displayCount = 20
-						}
-						linesPrinted += displayCount // IP lines
+
+					// Calculate how many will actually be displayed (limited by maxDisplay)
+					nodeMismatchDisplayCount := nodeMismatchCount
+					if nodeMismatchDisplayCount > maxDisplay {
+						nodeMismatchDisplayCount = maxDisplay
 					}
-					if missingInEIP > 0 {
-						linesPrinted += 1 // Header line
-						displayCount := missingInEIP
-						if displayCount > 20 {
-							displayCount = 20
-						}
-						linesPrinted += displayCount // IP lines
+
+					missingInEIPDisplayCount := missingInEIPCount
+					if missingInEIPDisplayCount > maxDisplay {
+						missingInEIPDisplayCount = maxDisplay
+					}
+
+					// Add lines for each section that will be displayed
+					// The display logic (lines 2845-2881) shows sections independently
+					// Each section: 1 header line + N IP lines
+					if nodeMismatchDisplayCount > 0 {
+						linesPrinted += 1                        // Header line ("Node mismatches:" or "Node mismatches (X shown of Y):")
+						linesPrinted += nodeMismatchDisplayCount // IP lines (one per displayed IP)
+					}
+					if missingInEIPDisplayCount > 0 {
+						linesPrinted += 1                        // Header line ("Missing in EIP:" or "Missing in EIP (X shown of Y):")
+						linesPrinted += missingInEIPDisplayCount // IP lines (one per displayed IP)
 					}
 				}
 			}
@@ -2878,6 +3113,35 @@ func (em *EIPMonitor) MonitorLoop() error {
 			} else if progressTracker.iterationsWithoutProgress >= 10 && progressTracker.warningShown {
 				linesPrinted += 5 // OVN-Kube warning (5 lines: header + 4 commands)
 			}
+		}
+
+		// If we printed fewer lines than before, clear the extra lines from previous iteration
+		// Clear if:
+		// 1. Progress was detected (iterationsWithoutProgress reset to 0), OR
+		// 2. Mismatches were actually resolved (mismatchCount went to 0), OR
+		// 3. The mismatch list size changed (even if still showing)
+		// This ensures clean output when the list changes
+		progressDetected := prevIterationsWithoutProgress >= 10 && progressTracker.iterationsWithoutProgress < 10
+		mismatchesResolved := prevMismatchCount > 0 && mismatchCount == 0
+		// Also clear if mismatch list changed size (even if still showing the list)
+		mismatchListChanged := prevLinesPrinted != linesPrinted && prevLinesPrinted > 0 && mismatchCount > 0
+		shouldClearLines := prevLinesPrinted > linesPrinted && isTerminal && (progressDetected || mismatchesResolved || mismatchListChanged)
+
+		if shouldClearLines {
+			// After printing new (shorter) content, we need to clear the remaining old lines
+			// At this point:
+			// - We moved up prevLinesPrinted at the start of iteration
+			// - We printed linesPrinted lines of new content
+			// - Cursor is now at the end of the new content (after linesPrinted lines)
+			// - We need to clear (prevLinesPrinted - linesPrinted) extra lines of old content below
+			linesToClear := prevLinesPrinted - linesPrinted
+			for i := 0; i < linesToClear; i++ {
+				fmt.Printf("\033[K\n") // Clear line and move to next
+			}
+			// After clearing, cursor is at the bottom of the cleared area
+			// For next iteration, we need cursor to be at the end of the new content
+			// So we move back up by linesToClear to position at end of new content
+			fmt.Printf("\033[%dA", linesToClear)
 		}
 
 		// Flush stdout to ensure output is displayed immediately
@@ -2893,9 +3157,22 @@ func (em *EIPMonitor) MonitorLoop() error {
 			fmt.Fprintf(os.Stderr, "Error flushing logs: %v\n", err)
 		}
 
+		// Calculate total Azure resources across all nodes
+		totalAzureEIPs := 0
+		totalAzureLBs := 0
+		for _, data := range nodeData {
+			totalAzureEIPs += data.AzureEIPs
+			totalAzureLBs += data.AzureLBs
+		}
+
+		// Store current linesPrinted, mismatchCount, and progress state for next iteration's cursor movement
+		prevLinesPrinted = linesPrinted
+		prevMismatchCount = mismatchCount
+		prevIterationsWithoutProgress = progressTracker.iterationsWithoutProgress
+
 		// Always do at least one iteration to show current state
 		// After first iteration, check if monitoring should continue
-		shouldContinue := em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs)
+		shouldContinue := em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs)
 		if iterationCount == 1 && !shouldContinue {
 			// First iteration shows state, but we don't need to continue - exit immediately
 			fmt.Printf("\n") // Add final newline
@@ -2910,7 +3187,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 		time.Sleep(1 * time.Second)
 	}
 
-	log.Println("Monitoring complete - all EIPs assigned and CPIC issues resolved")
+	log.Println("Monitoring complete - all EIPs assigned, CPIC issues resolved, and Azure EIPs match expected state")
 	return nil
 }
 
@@ -3063,9 +3340,52 @@ func (dp *DataProcessor) MergeLogs() error {
 		outFile.Close()
 	}
 
+	// Process status_event files (special handling - file name is {node}_status_event_event.log)
+	// First, check if any status event log files exist
+	hasStatusEvents := false
+	for _, node := range nodes {
+		logFile := filepath.Join(dp.logsDir, fmt.Sprintf("%s_status_event_event.log", node))
+		if _, err := os.Stat(logFile); err == nil {
+			hasStatusEvents = true
+			break
+		}
+	}
+
+	// Only create status_event.dat if we actually have event log files
+	if hasStatusEvents {
+		dataFile := filepath.Join(dp.dataDir, "status_event.dat")
+		outFile, err := os.Create(dataFile)
+		if err == nil {
+			for _, node := range nodes {
+				logFile := filepath.Join(dp.logsDir, fmt.Sprintf("%s_status_event_event.log", node))
+				if _, err := os.Stat(logFile); err == nil {
+					fmt.Fprintf(outFile, "\"%s\"\n", node)
+
+					inFile, err := os.Open(logFile)
+					if err == nil {
+						buf := make([]byte, 1024)
+						for {
+							n, err := inFile.Read(buf)
+							if n > 0 {
+								outFile.Write(buf[:n])
+							}
+							if err != nil {
+								break
+							}
+						}
+						inFile.Close()
+						fmt.Fprintf(outFile, "\n\n")
+					}
+				}
+			}
+			outFile.Close()
+		}
+	}
+
 	// Process cluster-level metrics (no node prefix, single value per timestamp)
 	clusterMetrics := []string{
 		"ocp_eips_configured.log",
+		"ocp_eips_requested.log",
 		"ocp_eips_assigned.log",
 		"ocp_eips_unassigned.log",
 		"ocp_cpic_success.log",
@@ -3075,6 +3395,7 @@ func (dp *DataProcessor) MergeLogs() error {
 		"cluster_summary_total_secondary_eips.log",
 		"cluster_summary_total_assigned_eips.log",
 		"cluster_summary_total_azure_eips.log",
+		"cluster_summary_total_azure_lbs.log",
 		"cluster_summary_node_count.log",
 		"cluster_summary_avg_eips_per_node.log",
 		"malfunctioning_eip_objects_count.log",
@@ -3228,6 +3549,82 @@ type DataPoint struct {
 	Value float64
 }
 
+type EventPoint struct {
+	Time  time.Time
+	Event string // e.g., "status_change:Ready:NotReady"
+}
+
+// parseEventFile parses a status event .dat file and returns node events with timestamps
+func (pg *PlotGenerator) parseEventFile(filename string) (map[string][]EventPoint, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	nodeEvents := make(map[string][]EventPoint)
+	var currentNode string
+	var events []EventPoint
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" {
+			if currentNode != "" && len(events) > 0 {
+				nodeEvents[currentNode] = events
+				events = []EventPoint{}
+			}
+			currentNode = ""
+			continue
+		}
+
+		if strings.HasPrefix(line, `"`) && strings.HasSuffix(line, `"`) {
+			if currentNode != "" && len(events) > 0 {
+				nodeEvents[currentNode] = events
+			}
+			currentNode = strings.Trim(line, `"`)
+			events = []EventPoint{}
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			timestampStr := parts[0]
+			// Join all remaining parts as the event string
+			// The event string format is: "status_change:Ready:NotReady" or similar
+			eventStr := strings.Join(parts[1:], " ")
+
+			var t time.Time
+			var parseErr error
+			t, parseErr = time.Parse(time.RFC3339, timestampStr)
+			if parseErr != nil {
+				t, parseErr = time.Parse("060102_150405", timestampStr)
+				if parseErr != nil {
+					t, parseErr = time.Parse("2006-01-02T15:04:05Z", timestampStr)
+					if parseErr != nil {
+						continue
+					}
+				}
+			}
+
+			// Only add events that match status_change pattern
+			if strings.HasPrefix(eventStr, "status_change:") {
+				events = append(events, EventPoint{
+					Time:  t,
+					Event: eventStr,
+				})
+			}
+		}
+	}
+
+	if currentNode != "" && len(events) > 0 {
+		nodeEvents[currentNode] = events
+	}
+
+	return nodeEvents, scanner.Err()
+}
+
 func (pg *PlotGenerator) GenerateAllPlots() error {
 	log.Println("Starting plot generation...")
 
@@ -3252,12 +3649,30 @@ func (pg *PlotGenerator) GenerateAllPlots() error {
 		plotName := strings.TrimSuffix(baseName, ".dat") + ".png"
 		plotPath := filepath.Join(pg.plotsDir, plotName)
 
+		// Skip status_event.dat if it's empty (no status changes occurred)
+		if baseName == "status_event.dat" {
+			nodeData, err := pg.parseDataFile(dataFile)
+			if err != nil || len(nodeData) == 0 {
+				continue // Skip silently if empty or error
+			}
+		}
+
 		if err := pg.generatePlot(dataFile, plotPath, baseName); err != nil {
-			log.Printf("Warning: Failed to generate plot for %s: %v", baseName, err)
+			// Only log warnings for non-optional files
+			if baseName != "status_event.dat" {
+				log.Printf("Warning: Failed to generate plot for %s: %v", baseName, err)
+			}
 			continue
 		}
 
 		log.Printf("Generated plot: %s", plotPath)
+	}
+
+	// Generate comprehensive dashboard plot
+	if err := pg.GenerateDashboardPlot(); err != nil {
+		log.Printf("Warning: Failed to generate dashboard plot: %v", err)
+	} else {
+		log.Println("Generated dashboard plot")
 	}
 
 	log.Println("Plot generation complete")
@@ -3267,11 +3682,81 @@ func (pg *PlotGenerator) GenerateAllPlots() error {
 func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 	nodeData, err := pg.parseDataFile(dataFile)
 	if err != nil {
+		// If file doesn't exist or can't be read, skip silently (it's optional)
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
 
 	if len(nodeData) == 0 {
+		// For optional files like status_event.dat, skip silently if empty
+		baseName := filepath.Base(dataFile)
+		if baseName == "status_event.dat" {
+			return nil
+		}
 		return fmt.Errorf("no data found in file")
+	}
+
+	// Load events for this plot (only for per-node plots, not cluster-level)
+	eventData := make(map[string][]EventPoint)
+	baseName := filepath.Base(dataFile)
+
+	// Determine if this is a per-node plot by checking if the data contains node names (not "cluster")
+	// First, check the parsed data to see if it has actual node names
+	isPerNodePlot := false
+	for node := range nodeData {
+		if node != "cluster" && node != "" {
+			isPerNodePlot = true
+			break
+		}
+	}
+
+	// Also exclude known cluster-level files that don't have per-node data
+	clusterLevelFiles := []string{
+		"ocp_eips_configured.dat",
+		"ocp_eips_requested.dat",
+		"ocp_eips_assigned.dat",
+		"ocp_eips_unassigned.dat",
+		"ocp_cpic_success.dat", // Cluster-level CPIC (not per-node)
+		"ocp_cpic_pending.dat", // Cluster-level CPIC (not per-node)
+		"ocp_cpic_error.dat",   // Cluster-level CPIC (not per-node)
+		"malfunctioning_eip_objects_count.dat",
+		"overcommitted_eip_objects_count.dat",
+		"eip_cpic_mismatches_total.dat",
+		"eip_cpic_mismatches_node_mismatch.dat",
+		"eip_cpic_mismatches_missing_in_eip.dat",
+		"cluster_summary_",
+		"status_event.dat",
+	}
+
+	isClusterLevel := false
+	for _, clusterFile := range clusterLevelFiles {
+		if strings.HasPrefix(baseName, clusterFile) || strings.Contains(baseName, clusterFile) {
+			isClusterLevel = true
+			break
+		}
+	}
+
+	// Load events for per-node plots only
+	if isPerNodePlot && !isClusterLevel {
+		eventFile := filepath.Join(pg.dataDir, "status_event.dat")
+		if events, err := pg.parseEventFile(eventFile); err == nil {
+			eventData = events
+			// Debug: log if events were found
+			totalEvents := 0
+			for _, nodeEvents := range events {
+				totalEvents += len(nodeEvents)
+			}
+			if totalEvents > 0 {
+				log.Printf("Loaded %d status events for plot %s", totalEvents, baseName)
+			}
+		} else {
+			// Only log if file exists but parsing failed
+			if _, statErr := os.Stat(eventFile); statErr == nil {
+				log.Printf("Warning: Failed to parse status events from %s: %v", eventFile, err)
+			}
+		}
 	}
 
 	p := plot.New()
@@ -3279,10 +3764,28 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 	p.X.Label.Text = "Time"
 	p.Y.Label.Text = "Value"
 	p.X.Tick.Marker = plot.TimeTicks{Format: "15:04:05"}
-	p.Legend.Top = true
 
-	// Color palette for different nodes
-	colors := []string{"blue", "red", "green", "orange", "purple", "brown", "pink", "gray"}
+	// Configure legend to be centered below the plot
+	p.Legend.Top = false // Place legend below the plot (under time axis)
+	// To center: Left=false means right-aligned, then we offset left by half the plot width
+	// For a 10 inch plot, approximate center is around -250 points from right edge
+	p.Legend.Left = false                       // Right-align first
+	p.Legend.XOffs = vg.Points(-250)            // Offset left to center (approximate for 10" plot)
+	p.Legend.YOffs = vg.Points(-50)             // Position below the "Time" label and timestamps
+	p.Legend.TextStyle.Font.Size = vg.Points(9) // Smaller font to fit more entries
+
+	// Color palette for different nodes - using distinguishable, accessible colors
+	// Colors chosen for good contrast and color-blind accessibility
+	colors := []color.Color{
+		color.RGBA{R: 0, G: 114, B: 178, A: 255},   // Blue - primary
+		color.RGBA{R: 213, G: 94, B: 0, A: 255},    // Orange/Red - secondary
+		color.RGBA{R: 0, G: 158, B: 115, A: 255},   // Teal/Green - tertiary
+		color.RGBA{R: 204, G: 121, B: 167, A: 255}, // Pink/Purple
+		color.RGBA{R: 230, G: 159, B: 0, A: 255},   // Yellow/Gold
+		color.RGBA{R: 86, G: 180, B: 233, A: 255},  // Sky Blue
+		color.RGBA{R: 240, G: 228, B: 66, A: 255},  // Yellow
+		color.RGBA{R: 0, G: 0, B: 0, A: 255},       // Black (fallback)
+	}
 
 	// Sort nodes for consistent ordering
 	sortedNodes := make([]string, 0, len(nodeData))
@@ -3292,6 +3795,27 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 		}
 	}
 	sort.Strings(sortedNodes)
+
+	// Find min/max Y values for event marker placement
+	minY := math.MaxFloat64
+	maxY := -math.MaxFloat64
+	for _, points := range nodeData {
+		for _, point := range points {
+			if point.Value < minY {
+				minY = point.Value
+			}
+			if point.Value > maxY {
+				maxY = point.Value
+			}
+		}
+	}
+	if minY == math.MaxFloat64 {
+		minY, maxY = 0, 100
+	}
+
+	// Place event markers at 90% of the Y range, so they're visible but don't overlap data
+	// This ensures they're always within the plot bounds
+	eventMarkerY := minY + (maxY-minY)*0.90
 
 	colorIdx := 0
 	for _, node := range sortedNodes {
@@ -3309,8 +3833,7 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 			return err
 		}
 
-		colorName := colors[colorIdx%len(colors)]
-		line.Color = getColor(colorName)
+		line.Color = colors[colorIdx%len(colors)]
 		line.Width = vg.Points(1.5)
 
 		p.Add(line)
@@ -3321,15 +3844,511 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 		}
 		p.Legend.Add(legendLabel, line)
 
+		// Helper function to get Y value on the line at a given time (interpolate if needed)
+		getYValueAtTime := func(eventTime time.Time) float64 {
+			eventUnix := float64(eventTime.Unix())
+
+			// Find exact match or nearest points
+			for i, point := range points {
+				if point.Time.Equal(eventTime) || point.Time.After(eventTime) {
+					if i == 0 {
+						// Before first point, return first value
+						return points[0].Value
+					}
+					// Interpolate between point[i-1] and point[i]
+					prevPoint := points[i-1]
+					nextPoint := point
+
+					prevX := float64(prevPoint.Time.Unix())
+					nextX := float64(nextPoint.Time.Unix())
+
+					if prevX == nextX {
+						return prevPoint.Value
+					}
+
+					// Linear interpolation
+					t := (eventUnix - prevX) / (nextX - prevX)
+					return prevPoint.Value + t*(nextPoint.Value-prevPoint.Value)
+				}
+			}
+
+			// After last point, return last value
+			if len(points) > 0 {
+				return points[len(points)-1].Value
+			}
+
+			// Fallback to eventMarkerY if no points
+			return eventMarkerY
+		}
+
+		// Add event markers for this node if events exist
+		if events, hasEvents := eventData[node]; hasEvents && len(events) > 0 {
+			// Group events by type to use different colors
+			notReadyEvents := make([]EventPoint, 0)
+			readyEvents := make([]EventPoint, 0)
+			schedulingDisabledEvents := make([]EventPoint, 0)
+			otherEvents := make([]EventPoint, 0)
+
+			// Helper function to get the TO state from status_change event
+			// Format: "status_change:FROM:TO"
+			getToState := func(eventStr string) string {
+				if !strings.HasPrefix(eventStr, "status_change:") {
+					return ""
+				}
+				// Remove "status_change:" prefix and split by ":"
+				parts := strings.TrimPrefix(eventStr, "status_change:")
+				states := strings.Split(parts, ":")
+				if len(states) >= 2 {
+					return states[len(states)-1] // Last part is the TO state
+				}
+				return ""
+			}
+
+			for _, event := range events {
+				toState := getToState(event.Event)
+				if toState == "NotReady" {
+					notReadyEvents = append(notReadyEvents, event)
+				} else if toState == "SchedulingDisabled" {
+					schedulingDisabledEvents = append(schedulingDisabledEvents, event)
+				} else if toState == "Ready" {
+					readyEvents = append(readyEvents, event)
+				} else {
+					otherEvents = append(otherEvents, event)
+				}
+			}
+
+			// Add markers for each event type with different colors
+			// Using high-contrast, accessible colors
+			eventGroups := []struct {
+				events []EventPoint
+				color  color.Color
+				label  string
+			}{
+				{notReadyEvents, color.RGBA{R: 220, G: 38, B: 38, A: 255}, "NotReady"},                     // Red - clear error indication
+				{schedulingDisabledEvents, color.RGBA{R: 234, G: 179, B: 8, A: 255}, "SchedulingDisabled"}, // Amber/Yellow - warning
+				{readyEvents, color.RGBA{R: 34, G: 197, B: 94, A: 255}, "Ready"},                           // Green - success
+				{otherEvents, color.RGBA{R: 249, G: 115, B: 22, A: 255}, "Other"},                          // Orange - neutral/other
+			}
+
+			// First pass: Add all markers positioned on the node's line
+			for _, group := range eventGroups {
+				if len(group.events) == 0 {
+					continue
+				}
+
+				eventPts := make(plotter.XYs, len(group.events))
+				for i, event := range group.events {
+					eventPts[i].X = float64(event.Time.Unix())
+					// Position marker on the node's line at this time
+					eventPts[i].Y = getYValueAtTime(event.Time)
+				}
+
+				scatter, err := plotter.NewScatter(eventPts)
+				if err != nil {
+					continue
+				}
+
+				scatter.GlyphStyle.Color = group.color
+				scatter.GlyphStyle.Radius = vg.Points(6) // Larger for better visibility
+
+				p.Add(scatter)
+				// Don't add event markers to main legend - they're already labeled with text annotations above
+				// p.Legend.Add(fmt.Sprintf("%s %s", shortenNodeName(node), group.label), scatter)
+			}
+
+			// Second pass: Add labels with overlap detection across ALL events for this node
+			// Collect all events from all groups into a single list
+			allEvents := make([]EventPoint, 0)
+			for _, group := range eventGroups {
+				allEvents = append(allEvents, group.events...)
+			}
+
+			// Sort all events by time
+			sort.Slice(allEvents, func(i, j int) bool {
+				return allEvents[i].Time.Before(allEvents[j].Time)
+			})
+
+			// Calculate time threshold for considering events "close" (within 90 seconds)
+			// Only check labels within this time window for overlap to optimize performance
+			timeThreshold := 90.0                 // seconds
+			baseLabelY := maxY + (maxY-minY)*0.10 // 10% above max, above the markers
+			labelSpacing := (maxY - minY) * 0.12  // 12% of Y range between stacked labels
+
+			// Calculate X range for horizontal offset calculations
+			minX := math.MaxFloat64
+			maxX := -math.MaxFloat64
+			for _, point := range points {
+				x := float64(point.Time.Unix())
+				if x < minX {
+					minX = x
+				}
+				if x > maxX {
+					maxX = x
+				}
+			}
+			xRange := maxX - minX
+			if xRange == 0 {
+				xRange = 3600 // Default to 1 hour in seconds
+			}
+
+			// Track label positions with X, Y, and description
+			type labelInfo struct {
+				x           float64 // Actual label X position (may be offset from eventX)
+				y           float64
+				description string
+			}
+			labelPositions := make(map[float64]labelInfo) // eventX -> labelInfo
+
+			// Helper function to get the TO state from status_change event
+			// Format: "status_change:FROM:TO"
+			getToStateForColor := func(eventStr string) string {
+				if !strings.HasPrefix(eventStr, "status_change:") {
+					return ""
+				}
+				// Remove "status_change:" prefix and split by ":"
+				parts := strings.TrimPrefix(eventStr, "status_change:")
+				states := strings.Split(parts, ":")
+				if len(states) >= 2 {
+					return states[len(states)-1] // Last part is the TO state
+				}
+				return ""
+			}
+
+			for _, event := range allEvents {
+				// Get the color for this event based on the TO state
+				var eventColor color.Color
+				toState := getToStateForColor(event.Event)
+				if toState == "NotReady" {
+					eventColor = color.RGBA{R: 220, G: 38, B: 38, A: 255}
+				} else if toState == "SchedulingDisabled" {
+					eventColor = color.RGBA{R: 234, G: 179, B: 8, A: 255}
+				} else if toState == "Ready" {
+					eventColor = color.RGBA{R: 34, G: 197, B: 94, A: 255}
+				} else {
+					eventColor = color.RGBA{R: 249, G: 115, B: 22, A: 255}
+				}
+
+				// Extract readable description from event string
+				description := formatEventDescription(event.Event)
+				if description == "" {
+					continue
+				}
+
+				eventX := float64(event.Time.Unix())
+				// Position marker on the node's line at this time
+				eventY := getYValueAtTime(event.Time)
+
+				// Find X and Y positions that don't overlap with nearby events
+				labelX := eventX // Start with original X position
+				labelY := baseLabelY
+
+				// Estimate text width in X units (seconds)
+				// Rough estimate: each character is about 0.3% of X range
+				textWidthX := float64(len(description)) * xRange * 0.003
+				if textWidthX < 10 {
+					textWidthX = 10 // Minimum width
+				}
+
+				// Find a position that doesn't conflict
+				maxAttempts := 15 // Maximum number of positions to try
+				found := false
+
+				for attempt := 0; attempt < maxAttempts && !found; attempt++ {
+					// Try different Y levels
+					candidateY := baseLabelY + float64(attempt)*labelSpacing
+
+					// For each Y level, try horizontal offsets
+					horizontalOffsets := []float64{0, -textWidthX * 0.6, textWidthX * 0.6, -textWidthX * 1.2, textWidthX * 1.2}
+
+					for _, xOffset := range horizontalOffsets {
+						candidateX := eventX + xOffset
+
+						// Check if this position conflicts with any existing label
+						conflicts := false
+						for otherEventX, otherInfo := range labelPositions {
+							// Only check labels within time threshold for performance
+							timeDiff := math.Abs(eventX - otherEventX)
+							if timeDiff > timeThreshold {
+								continue
+							}
+
+							// Calculate distance between label centers
+							dx := math.Abs(candidateX - otherInfo.x)
+							dy := math.Abs(candidateY - otherInfo.y)
+
+							// Estimate other label's text width
+							otherTextWidthX := float64(len(otherInfo.description)) * xRange * 0.003
+							if otherTextWidthX < 10 {
+								otherTextWidthX = 10
+							}
+
+							// Check if labels would overlap
+							// Horizontal overlap: X positions are within combined text widths
+							horizontalOverlap := dx < (textWidthX/2 + otherTextWidthX/2 + xRange*0.01) // Small margin
+							// Vertical overlap: Y positions are too close
+							verticalOverlap := dy < labelSpacing*0.7
+
+							// If both horizontal and vertical overlap, it's a conflict
+							if horizontalOverlap && verticalOverlap {
+								conflicts = true
+								break
+							}
+						}
+
+						if !conflicts {
+							labelX = candidateX
+							labelY = candidateY
+							found = true
+							break
+						}
+					}
+				}
+
+				// Store this label position
+				labelPositions[eventX] = labelInfo{x: labelX, y: labelY, description: description}
+
+				// Create dotted line from marker (on the line) to label
+				// Label may be offset horizontally, so connect to actual label position
+				storedLabelInfo := labelPositions[eventX]
+				linePts := plotter.XYs{
+					{X: eventX, Y: eventY},
+					{X: storedLabelInfo.x, Y: storedLabelInfo.y},
+				}
+
+				dottedLine, err := plotter.NewLine(linePts)
+				if err == nil {
+					dottedLine.Color = eventColor
+					dottedLine.Width = vg.Points(0.5)
+					dottedLine.Dashes = []vg.Length{vg.Points(2), vg.Points(2)} // Dotted pattern
+					p.Add(dottedLine)
+				}
+
+				// Add text annotation at the calculated position using Labels
+				// Truncate long descriptions to keep them readable
+				if len(description) > 20 {
+					description = description[:17] + "..."
+				}
+
+				// Create a label point for this event
+				// Use the stored position from labelPositions (may be offset)
+				storedLabelInfo = labelPositions[eventX]
+				labelPts := plotter.XYLabels{
+					XYs:    plotter.XYs{{X: storedLabelInfo.x, Y: storedLabelInfo.y}},
+					Labels: []string{description},
+				}
+
+				labels, err := plotter.NewLabels(labelPts)
+				if err == nil {
+					// Set text style for labels (TextStyle is a slice, so we need to set each element)
+					if len(labels.TextStyle) > 0 {
+						labels.TextStyle[0].Color = eventColor
+						labels.TextStyle[0].Font.Size = vg.Points(8) // Small font to not obstruct
+					}
+					p.Add(labels)
+				}
+			}
+		}
+
 		colorIdx++
 	}
 
-	// Save plot
-	if err := p.Save(10*vg.Inch, 6*vg.Inch, plotPath); err != nil {
+	// Save plot with extra height to accommodate legend at bottom and event labels at top
+	if err := p.Save(10*vg.Inch, 7*vg.Inch, plotPath); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// GenerateDashboardPlot creates a comprehensive dashboard with multiple metrics
+func (pg *PlotGenerator) GenerateDashboardPlot() error {
+	p := plot.New()
+	p.Title.Text = "EIP Monitoring Dashboard"
+	p.Title.TextStyle.Font.Size = vg.Points(16)
+	p.Title.Padding = vg.Points(10)
+
+	// Load key metrics
+	clusterMetrics := map[string]string{
+		"EIPs":           "ocp_eips_assigned.dat",
+		"CPIC Success":   "ocp_cpic_success.dat",
+		"CPIC Errors":    "ocp_cpic_error.dat",
+		"Malfunctioning": "malfunctioning_eip_objects_count.dat",
+		"Overcommitted":  "overcommitted_eip_objects_count.dat",
+	}
+
+	// Load per-node metrics
+	nodeMetrics := []string{
+		"ocp_cpic_success.dat",
+		"ocp_eip_assigned.dat",
+		"ocp_eip_primary.dat",
+		"ocp_eip_secondary.dat",
+	}
+
+	// Collect all node names from any per-node file
+	nodes := make(map[string]bool)
+	for _, metric := range nodeMetrics {
+		dataFile := filepath.Join(pg.dataDir, metric)
+		if nodeData, err := pg.parseDataFile(dataFile); err == nil {
+			for node := range nodeData {
+				if node != "cluster" {
+					nodes[node] = true
+				}
+			}
+		}
+	}
+
+	nodeList := make([]string, 0, len(nodes))
+	for node := range nodes {
+		nodeList = append(nodeList, node)
+	}
+	sort.Strings(nodeList)
+
+	// Color palette - using distinguishable, accessible colors
+	// Colors chosen for good contrast and color-blind accessibility
+	colors := []color.Color{
+		color.RGBA{R: 0, G: 114, B: 178, A: 255},   // Blue - primary
+		color.RGBA{R: 213, G: 94, B: 0, A: 255},    // Orange/Red - secondary
+		color.RGBA{R: 0, G: 158, B: 115, A: 255},   // Teal/Green - tertiary
+		color.RGBA{R: 204, G: 121, B: 167, A: 255}, // Pink/Purple
+		color.RGBA{R: 230, G: 159, B: 0, A: 255},   // Yellow/Gold
+		color.RGBA{R: 86, G: 180, B: 233, A: 255},  // Sky Blue
+		color.RGBA{R: 240, G: 228, B: 66, A: 255},  // Yellow
+		color.RGBA{R: 0, G: 0, B: 0, A: 255},       // Black (fallback)
+	}
+
+	// Plot cluster-level metrics
+	colorIdx := 0
+	for label, filename := range clusterMetrics {
+		dataFile := filepath.Join(pg.dataDir, filename)
+		nodeData, err := pg.parseDataFile(dataFile)
+		if err != nil || len(nodeData) == 0 {
+			continue
+		}
+
+		// Get cluster data (or sum of all nodes if cluster not available)
+		var points []DataPoint
+		if clusterData, ok := nodeData["cluster"]; ok && len(clusterData) > 0 {
+			points = clusterData
+		} else {
+			// Sum across all nodes
+			pointMap := make(map[int64]float64) // timestamp -> sum
+			for _, nodePoints := range nodeData {
+				for _, pt := range nodePoints {
+					ts := pt.Time.Unix()
+					pointMap[ts] += pt.Value
+				}
+			}
+			points = make([]DataPoint, 0, len(pointMap))
+			for ts, val := range pointMap {
+				points = append(points, DataPoint{
+					Time:  time.Unix(ts, 0),
+					Value: val,
+				})
+			}
+			sort.Slice(points, func(i, j int) bool {
+				return points[i].Time.Before(points[j].Time)
+			})
+		}
+
+		if len(points) == 0 {
+			continue
+		}
+
+		pts := make(plotter.XYs, len(points))
+		for i, point := range points {
+			pts[i].X = float64(point.Time.Unix())
+			pts[i].Y = point.Value
+		}
+
+		line, err := plotter.NewLine(pts)
+		if err != nil {
+			continue
+		}
+
+		line.Color = colors[colorIdx%len(colors)]
+		line.Width = vg.Points(1.5)
+		p.Add(line)
+		p.Legend.Add(label, line)
+
+		colorIdx++
+	}
+
+	// Plot per-node metrics (primary EIPs) - one line per node
+	primaryDataFile := filepath.Join(pg.dataDir, "ocp_eip_primary.dat")
+	if primaryData, err := pg.parseDataFile(primaryDataFile); err == nil {
+		for _, node := range nodeList {
+			if nodePoints, ok := primaryData[node]; ok && len(nodePoints) > 0 {
+				pts := make(plotter.XYs, len(nodePoints))
+				for i, point := range nodePoints {
+					pts[i].X = float64(point.Time.Unix())
+					pts[i].Y = point.Value
+				}
+
+				line, err := plotter.NewLine(pts)
+				if err != nil {
+					continue
+				}
+
+				line.Color = colors[colorIdx%len(colors)]
+				line.Width = vg.Points(1.2) // Slightly thinner for node lines but still readable
+				p.Add(line)
+				p.Legend.Add(fmt.Sprintf("%s (Primary EIPs)", shortenNodeName(node)), line)
+
+				colorIdx++
+			}
+		}
+	}
+
+	// Configure axes
+	p.X.Label.Text = "Time"
+	p.X.Tick.Marker = plot.TimeTicks{Format: "15:04:05"}
+	p.Y.Label.Text = "Count"
+	// Configure legend to be centered below the plot
+	p.Legend.Top = false // Place legend below the plot (under time axis)
+	// To center: Left=false means right-aligned, then we offset left by half the plot width
+	// For a 10 inch plot, approximate center is around -250 points from right edge
+	p.Legend.Left = false                       // Right-align first
+	p.Legend.XOffs = vg.Points(-250)            // Offset left to center (approximate for 10" plot)
+	p.Legend.YOffs = vg.Points(-50)             // Position below the "Time" label and timestamps
+	p.Legend.TextStyle.Font.Size = vg.Points(9) // Smaller font to fit more entries
+
+	// Save large dashboard plot with extra height to accommodate legend at bottom
+	dashboardPath := filepath.Join(pg.plotsDir, "dashboard.png")
+	if err := p.Save(20*vg.Inch, 13*vg.Inch, dashboardPath); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// shortenNodeName shortens long node names for legend readability
+func shortenNodeName(nodeName string) string {
+	// Extract key parts: take last 3 segments if it's a long name
+	parts := strings.Split(nodeName, "-")
+	if len(parts) > 4 {
+		return strings.Join(parts[len(parts)-3:], "-")
+	}
+	return nodeName
+}
+
+// formatEventDescription converts event string to readable format
+// e.g., "status_change:Ready:NotReady" -> "Ready→NotReady"
+func formatEventDescription(eventStr string) string {
+	if !strings.HasPrefix(eventStr, "status_change:") {
+		return ""
+	}
+
+	// Remove "status_change:" prefix
+	parts := strings.TrimPrefix(eventStr, "status_change:")
+
+	// Split by ":" to get from/to states
+	states := strings.Split(parts, ":")
+	if len(states) == 2 {
+		return fmt.Sprintf("%s→%s", states[0], states[1])
+	}
+
+	// If format is different, return as-is (cleaned up)
+	return strings.ReplaceAll(parts, ":", "→")
 }
 
 // getColor converts a color name to a color.Color
@@ -3386,13 +4405,19 @@ func PrintCurrentState() error {
 	}
 	sort.Strings(nodes)
 
-	// Get global statistics
-	eipStats, err := ocClient.GetEIPStats()
+	// Fetch EIP and CPIC data once for all checks
+	eipData, cpicData, err := ocClient.FetchEIPAndCPICData()
 	if err != nil {
 		return err
 	}
 
-	cpicStats, err := ocClient.GetCPICStats()
+	// Get global statistics from pre-fetched data
+	eipStats, err := ocClient.GetEIPStatsFromData(eipData)
+	if err != nil {
+		return err
+	}
+
+	cpicStats, err := ocClient.GetCPICStatsFromData(cpicData)
 	if err != nil {
 		return err
 	}
@@ -3402,8 +4427,8 @@ func PrintCurrentState() error {
 		cnccStats = &CNCCStats{}
 	}
 
-	malfunctioningEIPs, _ := ocClient.CountMalfunctioningEIPObjects()
-	overcommittedEIPs, _ := ocClient.CountOvercommittedEIPObjects()
+	malfunctioningEIPs, _ := ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
+	overcommittedEIPs, _ := ocClient.CountOvercommittedEIPObjects(eipData)
 
 	// Collect node data
 	var wg sync.WaitGroup
@@ -3490,10 +4515,24 @@ func PrintCurrentState() error {
 			eipStr, secondaryEIPStr, azureEIPsStr, azureLBsStr, capacityStr)
 	}
 
+	// Get EIP resource count (number of EIP objects) from pre-fetched data
+	eipResourceCount := 0
+	if eipData != nil {
+		if items, ok := eipData["items"].([]interface{}); ok {
+			eipResourceCount = len(items)
+		}
+	}
+
 	// Print cluster summary with proper formatting
-	configuredStr := formatValue(eipStats.Configured, false, isTerminal)
+	// Configured EIPs = number of EIP objects (resources)
+	// Requested EIPs = total number of IPs configured (eipStats.Configured)
+	configuredStr := formatValue(eipResourceCount, false, isTerminal)
+	requestedStr := formatValue(eipStats.Configured, false, isTerminal)
 	successfulStr := formatValue(cpicStats.Success, false, isTerminal)
-	assignedStr := formatValue(totalAssignedEIPs, false, isTerminal)
+	// Format Assigned EIP as x/y where x is primary and y is secondary
+	primaryEIPStr := formatValue(totalPrimaryEIPs, false, isTerminal)
+	secondaryEIPStr := formatValue(totalSecondaryEIPs, false, isTerminal)
+	assignedStr := fmt.Sprintf("%s/%s", primaryEIPStr, secondaryEIPStr)
 
 	// Format malfunctioning EIPs - red if > 0
 	malfunctionStr := fmt.Sprintf("%d", malfunctioningEIPs)
@@ -3567,21 +4606,27 @@ func PrintCurrentState() error {
 		}
 	}
 
-	fmt.Printf("%s%s Configured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
-		clearLine, summaryLabel, configuredStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+	fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+		clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 	fmt.Printf("\n")
 
 	return nil
 }
 
 func cmdMonitor() error {
+	// Verify system:admin access before proceeding
+	ocClient := NewOpenShiftClient()
+	if err := ocClient.VerifySystemAdminAccess(); err != nil {
+		return err
+	}
+
 	subscriptionID, resourceGroup, err := validateEnvironment()
 	if err != nil {
 		return err
 	}
 
 	// Check if monitoring is needed BEFORE creating directories
-	ocClient := NewOpenShiftClient()
+	// Note: ocClient already created and verified above
 	eipStats, err := ocClient.GetEIPStats()
 	if err != nil {
 		return err
@@ -3599,13 +4644,30 @@ func cmdMonitor() error {
 	if err != nil {
 		overcommittedEIPs = 0 // Default to 0 if we can't determine
 	}
-	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
-		// Print current state once, then exit without creating directories
-		if err := PrintCurrentState(); err != nil {
-			return err
+
+	// Get Azure resources for the check
+	// We need to get node data to calculate total Azure resources
+	nodes, err := ocClient.GetEIPEnabledNodes()
+	if err != nil {
+		// If we can't get nodes, continue monitoring
+	} else {
+		azClient := NewAzureClient(subscriptionID, resourceGroup)
+		totalAzureEIPs := 0
+		totalAzureLBs := 0
+		for _, node := range nodes {
+			azureEIPs, azureLBs, _ := azClient.GetNodeNICStats(node)
+			totalAzureEIPs += azureEIPs
+			totalAzureLBs += azureLBs
 		}
-		log.Println("No monitoring needed - all EIPs properly configured")
-		return nil
+
+		if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs) {
+			// Print current state once, then exit without creating directories
+			if err := PrintCurrentState(); err != nil {
+				return err
+			}
+			log.Println("No monitoring needed - all EIPs properly configured and Azure EIPs match expected state")
+			return nil
+		}
 	}
 
 	// Create directories for monitoring output
@@ -3651,6 +4713,12 @@ func cmdPlot(directory string) error {
 }
 
 func cmdAll() error {
+	// Verify system:admin access before proceeding
+	ocClient := NewOpenShiftClient()
+	if err := ocClient.VerifySystemAdminAccess(); err != nil {
+		return err
+	}
+
 	subscriptionID, resourceGroup, err := validateEnvironment()
 	if err != nil {
 		return err
@@ -3662,7 +4730,7 @@ func cmdAll() error {
 	log.Println("📊 Phase 1: Starting EIP Monitoring...")
 
 	// Check if monitoring is needed BEFORE creating directories
-	ocClient := NewOpenShiftClient()
+	// Note: ocClient already created and verified above
 	eipStats, err := ocClient.GetEIPStats()
 	if err != nil {
 		return err
@@ -3680,13 +4748,30 @@ func cmdAll() error {
 	if err != nil {
 		overcommittedEIPs = 0 // Default to 0 if we can't determine
 	}
-	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
-		// Print current state once, then exit without creating directories
-		if err := PrintCurrentState(); err != nil {
-			return err
+
+	// Get Azure resources for the check
+	// We need to get node data to calculate total Azure resources
+	nodes, err := ocClient.GetEIPEnabledNodes()
+	if err != nil {
+		// If we can't get nodes, continue monitoring
+	} else {
+		azClient := NewAzureClient(subscriptionID, resourceGroup)
+		totalAzureEIPs := 0
+		totalAzureLBs := 0
+		for _, node := range nodes {
+			azureEIPs, azureLBs, _ := azClient.GetNodeNICStats(node)
+			totalAzureEIPs += azureEIPs
+			totalAzureLBs += azureLBs
 		}
-		log.Println("No monitoring needed - pipeline complete")
-		return nil
+
+		if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs) {
+			// Print current state once, then exit without creating directories
+			if err := PrintCurrentState(); err != nil {
+				return err
+			}
+			log.Println("No monitoring needed - pipeline complete")
+			return nil
+		}
 	}
 
 	// Create directories for monitoring output
