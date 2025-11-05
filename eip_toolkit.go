@@ -2341,7 +2341,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 	}
 	progressTracker.baselineNodeEIPs = make(map[string]int)
 
+	iterationCount := 0
 	for {
+		iterationCount++
 		timestamp := time.Now().Format(time.RFC3339)
 
 		// Get global statistics once per iteration
@@ -2394,6 +2396,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		em.bufferedLogger.LogStats(timestamp, "malfunctioning_eip_objects", map[string]interface{}{
 			"count": malfunctioningEIPs,
+		})
+
+		em.bufferedLogger.LogStats(timestamp, "overcommitted_eip_objects", map[string]interface{}{
+			"count": overcommittedEIPs,
 		})
 
 		// Collect node data in parallel
@@ -2887,12 +2893,20 @@ func (em *EIPMonitor) MonitorLoop() error {
 			fmt.Fprintf(os.Stderr, "Error flushing logs: %v\n", err)
 		}
 
-		// Check if monitoring should continue
-		if !em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
+		// Always do at least one iteration to show current state
+		// After first iteration, check if monitoring should continue
+		shouldContinue := em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs)
+		if iterationCount == 1 && !shouldContinue {
+			// First iteration shows state, but we don't need to continue - exit immediately
+			fmt.Printf("\n") // Add final newline
+			break
+		} else if iterationCount > 1 && !shouldContinue {
+			// Subsequent iterations: exit when monitoring is complete
 			fmt.Printf("\n") // Add final newline
 			break
 		}
 
+		// Sleep before next iteration
 		time.Sleep(1 * time.Second)
 	}
 
@@ -3001,14 +3015,17 @@ func (dp *DataProcessor) MergeLogs() error {
 		log.Println("No node-specific log files found")
 	}
 
-	// Process each file type
+	// Process per-node file types
 	fileMappings := map[string]string{
-		"ocp_cpic_success.log": "ocp_cpic_success.dat",
-		"ocp_cpic_pending.log": "ocp_cpic_pending.dat",
-		"ocp_cpic_error.log":   "ocp_cpic_error.dat",
-		"ocp_eip_assigned.log": "ocp_eip_assigned.dat",
-		"azure_eips.log":       "azure_eips.dat",
-		"azure_lbs.log":        "azure_lbs.dat",
+		"ocp_cpic_success.log":  "ocp_cpic_success.dat",
+		"ocp_cpic_pending.log":  "ocp_cpic_pending.dat",
+		"ocp_cpic_error.log":    "ocp_cpic_error.dat",
+		"ocp_eip_assigned.log":  "ocp_eip_assigned.dat",
+		"ocp_eip_primary.log":   "ocp_eip_primary.dat",
+		"ocp_eip_secondary.log": "ocp_eip_secondary.dat",
+		"azure_eips.log":        "azure_eips.dat",
+		"azure_lbs.log":         "azure_lbs.dat",
+		"capacity_capacity.log": "capacity_capacity.dat",
 	}
 
 	for logSuffix, datFilename := range fileMappings {
@@ -3046,6 +3063,59 @@ func (dp *DataProcessor) MergeLogs() error {
 		outFile.Close()
 	}
 
+	// Process cluster-level metrics (no node prefix, single value per timestamp)
+	clusterMetrics := []string{
+		"ocp_eips_configured.log",
+		"ocp_eips_assigned.log",
+		"ocp_eips_unassigned.log",
+		"ocp_cpic_success.log",
+		"ocp_cpic_pending.log",
+		"ocp_cpic_error.log",
+		"cluster_summary_total_primary_eips.log",
+		"cluster_summary_total_secondary_eips.log",
+		"cluster_summary_total_assigned_eips.log",
+		"cluster_summary_total_azure_eips.log",
+		"cluster_summary_node_count.log",
+		"cluster_summary_avg_eips_per_node.log",
+		"malfunctioning_eip_objects_count.log",
+		"overcommitted_eip_objects_count.log",
+		"eip_cpic_mismatches_total.log",
+		"eip_cpic_mismatches_node_mismatch.log",
+		"eip_cpic_mismatches_missing_in_eip.log",
+	}
+
+	for _, logFilename := range clusterMetrics {
+		logFile := filepath.Join(dp.logsDir, logFilename)
+		if _, err := os.Stat(logFile); err == nil {
+			// Create .dat file with same name (replace .log with .dat)
+			datFilename := strings.TrimSuffix(logFilename, ".log") + ".dat"
+			dataFile := filepath.Join(dp.dataDir, datFilename)
+			outFile, err := os.Create(dataFile)
+			if err != nil {
+				continue
+			}
+
+			inFile, err := os.Open(logFile)
+			if err != nil {
+				outFile.Close()
+				continue
+			}
+
+			buf := make([]byte, 1024)
+			for {
+				n, err := inFile.Read(buf)
+				if n > 0 {
+					outFile.Write(buf[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+			inFile.Close()
+			outFile.Close()
+		}
+	}
+
 	log.Println("Log merge completed successfully")
 	return nil
 }
@@ -3066,6 +3136,8 @@ func NewPlotGenerator(baseDir string) *PlotGenerator {
 }
 
 // parseDataFile parses a .dat file and returns node data with timestamps and values
+// For per-node files: returns map[node][]DataPoint
+// For cluster-level files: returns map["cluster"] or map[""] with single value time series
 func (pg *PlotGenerator) parseDataFile(filename string) (map[string][]DataPoint, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -3142,6 +3214,10 @@ func (pg *PlotGenerator) parseDataFile(filename string) (map[string][]DataPoint,
 	// Save last node's data
 	if currentNode != "" && len(points) > 0 {
 		nodeData[currentNode] = points
+	} else if len(points) > 0 {
+		// No node name found - this is a cluster-level file (single value time series)
+		// Use "cluster" as the key for consistency
+		nodeData["cluster"] = points
 	}
 
 	return nodeData, scanner.Err()
@@ -3238,7 +3314,12 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 		line.Width = vg.Points(1.5)
 
 		p.Add(line)
-		p.Legend.Add(node, line)
+		// For cluster-level files, use "value" instead of "cluster" in legend
+		legendLabel := node
+		if node == "cluster" && len(sortedNodes) == 1 {
+			legendLabel = "value"
+		}
+		p.Legend.Add(legendLabel, line)
 
 		colorIdx++
 	}
@@ -3294,6 +3375,205 @@ func validateEnvironment() (string, string, error) {
 	return subscription, resourceGroup, nil
 }
 
+// PrintCurrentState prints one iteration of monitoring state without logging or creating directories
+func PrintCurrentState() error {
+	ocClient := NewOpenShiftClient()
+	azClient := NewAzureClient(os.Getenv("AZ_SUBSCRIPTION"), os.Getenv("AZ_RESOURCE_GROUP"))
+
+	nodes, err := ocClient.GetEIPEnabledNodes()
+	if err != nil {
+		return err
+	}
+	sort.Strings(nodes)
+
+	// Get global statistics
+	eipStats, err := ocClient.GetEIPStats()
+	if err != nil {
+		return err
+	}
+
+	cpicStats, err := ocClient.GetCPICStats()
+	if err != nil {
+		return err
+	}
+
+	cnccStats, err := ocClient.GetCNCCStats()
+	if err != nil {
+		cnccStats = &CNCCStats{}
+	}
+
+	malfunctioningEIPs, _ := ocClient.CountMalfunctioningEIPObjects()
+	overcommittedEIPs, _ := ocClient.CountOvercommittedEIPObjects()
+
+	// Collect node data
+	var wg sync.WaitGroup
+	nodeData := make([]*NodeEIPData, len(nodes))
+	for i, node := range nodes {
+		wg.Add(1)
+		go func(idx int, nodeName string) {
+			defer wg.Done()
+			nodeStats, _ := ocClient.GetNodeStats(nodeName)
+			azureEIPs, azureLBs, _ := azClient.GetNodeNICStats(nodeName)
+			capacity, _ := ocClient.GetNodeCapacity(nodeName)
+			// Get node status
+			nodeStatus, _ := ocClient.GetNodeStatus(nodeName)
+			nodeData[idx] = &NodeEIPData{
+				Node:          nodeName,
+				EIPAssigned:   nodeStats.EIPAssigned,
+				SecondaryEIPs: nodeStats.SecondaryEIPs,
+				CPICSuccess:   nodeStats.CPICSuccess,
+				CPICPending:   nodeStats.CPICPending,
+				CPICError:     nodeStats.CPICError,
+				AzureEIPs:     azureEIPs,
+				AzureLBs:      azureLBs,
+				Capacity:      capacity,
+				Status:        nodeStatus,
+			}
+		}(i, node)
+	}
+	wg.Wait()
+
+	// Sort node data
+	sort.Slice(nodeData, func(i, j int) bool {
+		return nodeData[i].Node < nodeData[j].Node
+	})
+
+	// Calculate totals
+	totalPrimaryEIPs := 0
+	totalSecondaryEIPs := 0
+	totalAssignedEIPs := 0
+	for _, data := range nodeData {
+		totalPrimaryEIPs += data.EIPAssigned
+		totalSecondaryEIPs += data.SecondaryEIPs
+		totalAssignedEIPs += data.EIPAssigned + data.SecondaryEIPs
+	}
+
+	// Print state
+	isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
+	clearLine := ""
+	if isTerminal {
+		clearLine = "\033[K"
+	}
+	timestampStr := time.Now().Format("2006/01/02 15:04:05")
+	fmt.Printf("%s%s\n", clearLine, timestampStr)
+
+	for _, data := range nodeData {
+		// Format values (no highlighting since this is first/only iteration)
+		cpicSuccessStr := formatValue(data.CPICSuccess, false, isTerminal)
+		cpicPendingStr := formatValue(data.CPICPending, false, isTerminal)
+		cpicErrorStr := formatValueError(data.CPICError, false, isTerminal)
+		eipStr := formatValue(data.EIPAssigned, false, isTerminal)
+		secondaryEIPStr := formatValue(data.SecondaryEIPs, false, isTerminal)
+		azureEIPsStr := formatValue(data.AzureEIPs, false, isTerminal)
+		azureLBsStr := formatValue(data.AzureLBs, false, isTerminal)
+
+		// Format capacity
+		capacityStr := ""
+		if data.Capacity > 0 {
+			totalAssigned := data.EIPAssigned + data.SecondaryEIPs
+			availableCapacity := data.Capacity - totalAssigned
+			if availableCapacity < 0 {
+				availableCapacity = 0
+			}
+			capacityStr = fmt.Sprintf(", Capacity: %s/%d",
+				formatValue(availableCapacity, false, isTerminal),
+				data.Capacity)
+		} else {
+			capacityStr = ", Capacity: ?/?"
+		}
+
+		// Format node name with color based on status
+		nodeNameStr := formatNodeName(data.Node, data.Status, isTerminal)
+
+		fmt.Printf("%s%s - CPIC: %s/%s/%s, Primary EIPs: %s, Secondary EIPs: %s, Azure: %s/%s%s\n",
+			clearLine, nodeNameStr, cpicSuccessStr, cpicPendingStr, cpicErrorStr,
+			eipStr, secondaryEIPStr, azureEIPsStr, azureLBsStr, capacityStr)
+	}
+
+	// Print cluster summary with proper formatting
+	configuredStr := formatValue(eipStats.Configured, false, isTerminal)
+	successfulStr := formatValue(cpicStats.Success, false, isTerminal)
+	assignedStr := formatValue(totalAssignedEIPs, false, isTerminal)
+
+	// Format malfunctioning EIPs - red if > 0
+	malfunctionStr := fmt.Sprintf("%d", malfunctioningEIPs)
+	if malfunctioningEIPs > 0 && isTerminal {
+		malfunctionStr = fmt.Sprintf("\033[31;1m%d\033[0m", malfunctioningEIPs)
+	}
+
+	// Format overcommitted EIPs - yellow if > 0
+	overcommittedStr := fmt.Sprintf("%d", overcommittedEIPs)
+	if overcommittedEIPs > 0 && isTerminal {
+		overcommittedStr = fmt.Sprintf("\033[33;1m%d\033[0m", overcommittedEIPs)
+	}
+
+	cnccRunningStr := formatValue(cnccStats.PodsRunning, false, isTerminal)
+	cnccReadyStr := formatValue(cnccStats.PodsReady, false, isTerminal)
+	cnccQueueStr := ""
+	if cnccStats.QueueDepth > 0 {
+		cnccQueueStr = fmt.Sprintf(", Queue: %d", cnccStats.QueueDepth)
+	}
+
+	// Calculate cluster capacity
+	clusterCapacity := 0
+	if len(nodeData) > 0 {
+		firstNode := nodeData[0].Node
+		nodeDataRaw, err := ocClient.RunCommand([]string{"get", "node", firstNode, "-o", "json"})
+		if err == nil {
+			if metadata, ok := nodeDataRaw["metadata"].(map[string]interface{}); ok {
+				annotations, ok := metadata["annotations"].(map[string]interface{})
+				if ok {
+					egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
+					if ok && egressIPConfig != "" {
+						var configs []map[string]interface{}
+						if err := json.Unmarshal([]byte(egressIPConfig), &configs); err == nil {
+							for _, config := range configs {
+								if ifaddr, ok := config["ifaddr"].(map[string]interface{}); ok {
+									if ipv4, ok := ifaddr["ipv4"].(string); ok {
+										clusterCapacity = calculateSubnetSize(ipv4)
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	capacityStr := ""
+	if clusterCapacity > 0 {
+		totalCapacityUsed := 0
+		for _, data := range nodeData {
+			totalCapacityUsed += data.EIPAssigned + data.SecondaryEIPs
+		}
+		availableCapacity := clusterCapacity - totalCapacityUsed
+		if availableCapacity < 0 {
+			availableCapacity = 0 // Don't show negative
+		}
+		capacityStr = fmt.Sprintf(", Total Capacity: %d/%d", availableCapacity, clusterCapacity)
+	}
+
+	// Determine cluster summary label color
+	summaryLabel := "Cluster Summary:"
+	if isTerminal {
+		if cpicStats.Error > 0 {
+			// Red if CPIC errors exist
+			summaryLabel = fmt.Sprintf("\033[31;1m%s\033[0m", summaryLabel)
+		} else {
+			// Green if everything is OK
+			summaryLabel = fmt.Sprintf("\033[32m%s\033[0m", summaryLabel)
+		}
+	}
+
+	fmt.Printf("%s%s Configured EIPs: %s, Successful CPICs: %s, Assigned EIPs: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+		clearLine, summaryLabel, configuredStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+	fmt.Printf("\n")
+
+	return nil
+}
+
 func cmdMonitor() error {
 	subscriptionID, resourceGroup, err := validateEnvironment()
 	if err != nil {
@@ -3320,11 +3600,15 @@ func cmdMonitor() error {
 		overcommittedEIPs = 0 // Default to 0 if we can't determine
 	}
 	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
+		// Print current state once, then exit without creating directories
+		if err := PrintCurrentState(); err != nil {
+			return err
+		}
 		log.Println("No monitoring needed - all EIPs properly configured")
 		return nil
 	}
 
-	// Only create directories if monitoring is actually needed
+	// Create directories for monitoring output
 	timestamp := time.Now().Format("060102_150405")
 	var outputDir string
 	if outputDirVar != "" {
@@ -3397,11 +3681,15 @@ func cmdAll() error {
 		overcommittedEIPs = 0 // Default to 0 if we can't determine
 	}
 	if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs) {
+		// Print current state once, then exit without creating directories
+		if err := PrintCurrentState(); err != nil {
+			return err
+		}
 		log.Println("No monitoring needed - pipeline complete")
 		return nil
 	}
 
-	// Only create directories if monitoring is actually needed
+	// Create directories for monitoring output
 	timestamp := time.Now().Format("060102_150405")
 	var outputDir string
 	if outputDirVar != "" {

@@ -9,6 +9,12 @@ go mod download
 make build-main
 # Or manually:
 go build -o eip-toolkit eip_toolkit.go
+
+# Cross-platform builds:
+make build-darwin-amd64    # Intel Mac
+make build-darwin-arm64    # Apple Silicon
+make build-linux-amd64     # Linux x86_64
+make build-linux-arm64     # Linux ARM64
 ```
 
 Set environment variables:
@@ -50,6 +56,12 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 # Optimized pipeline
 ./eip-toolkit all-optimized
 ```
+
+**Early Exit Behavior:**
+- If all EIPs are already properly configured, the tool will:
+  - Print the current state once
+  - Exit without creating directories, logs, or graphs
+  - This allows quick status checks without generating files
 
 ### Output Structure
 
@@ -213,8 +225,10 @@ Example output:
 2025/11/04 17:55:22
 aro-worker-node1 - CPIC: 32/0/0, Primary EIPs: 30, Secondary EIPs: 2, Azure: 32/32, Capacity: 223/255
 aro-worker-node2 - CPIC: 33/0/0, Primary EIPs: 31, Secondary EIPs: 2, Azure: 33/33, Capacity: 222/255
-Cluster Summary: Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 445/510
+Cluster Summary: Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 342/512
 ```
+
+Note: Capacity values show available/total (e.g., "223/255" means 223 available out of 255 total capacity).
 
 **Metrics:**
 - **Primary EIPs**: First IP in `status.items` of each EIP resource assigned to the node. Each EIP resource contributes at most one Primary EIP.
@@ -231,6 +245,11 @@ Monitoring loop continues while:
 
 Where `expectedAssignable = Configured - unassignableIPs` (accounting for overcommitted EIPs).
 
+**Early Exit:**
+- If all EIPs are already properly configured, the tool prints current state once and exits
+- No directories, logs, or graphs are created when early exit occurs
+- This allows quick status checks without generating files
+
 **Overcommitment Handling:**
 - EIP resources with more IPs than available nodes cannot assign all IPs
 - Monitoring calculates unassignable IPs and exits when all assignable IPs are assigned
@@ -246,7 +265,7 @@ Where `expectedAssignable = Configured - unassignableIPs` (accounting for overco
 
 ### Logged Metrics
 
-The following metrics are logged to files for tracking and plotting:
+All logged metrics are automatically plotted. The following metrics are logged to files for tracking and plotting:
 
 **Per-Node Metrics:**
 - `{node}_ocp_cpic_success.log`, `{node}_ocp_cpic_pending.log`, `{node}_ocp_cpic_error.log`
@@ -271,6 +290,8 @@ The following metrics are logged to files for tracking and plotting:
 - `eip_cpic_mismatches_node_mismatch.log` - Node assignment mismatches
 - `eip_cpic_mismatches_missing_in_eip.log` - IPs in CPIC but not in EIP status
 
+**Note:** All metrics listed above are automatically processed into `.dat` files and plotted as PNG charts when using the `plot` or `all` commands.
+
 ### Implementation Details
 
 - Parallel node data collection using goroutines and semaphores
@@ -282,3 +303,13 @@ The following metrics are logged to files for tracking and plotting:
 - Progress tracking for conditional warning display
 - Mismatch detection between EIP and CPIC node assignments
 - Overcommitment detection for EIP resources with more IPs than available nodes
+- Early exit with state display when no monitoring needed
+- Cross-platform support (Linux x86_64/ARM64, macOS Intel/Apple Silicon)
+
+### Platform Support
+
+The toolkit builds and runs on:
+- **macOS**: Intel (x86_64) and Apple Silicon (ARM64)
+- **Linux**: x86_64 and ARM64
+
+All dependencies are pure Go with no CGO requirements, ensuring consistent behavior across platforms. External dependencies (`oc` and `az` CLI tools) must be installed separately for the target platform.
