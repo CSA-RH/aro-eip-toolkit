@@ -45,12 +45,13 @@ type CPICStats struct {
 }
 
 type NodeStats struct {
-	CPICSuccess int
-	CPICPending int
-	CPICError   int
-	EIPAssigned int
-	AzureEIPs   int
-	AzureLBs    int
+	CPICSuccess   int
+	CPICPending   int
+	CPICError     int
+	EIPAssigned   int // Primary EIPs (first IP from each EIP resource on this node)
+	SecondaryEIPs int // Secondary EIPs (remaining IPs: CPIC Success - Primary)
+	AzureEIPs     int
+	AzureLBs      int
 }
 
 // SmartCache provides intelligent caching with TTL and LRU eviction
@@ -731,12 +732,14 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	}
 
 	// Get EIP stats for the node
+	// Primary EIPs = number of EIP resources that have at least one IP on this node
+	// Secondary EIPs = CPIC Success - Primary EIPs
 	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
 
-	eipAssigned := 0
+	primaryEIPs := 0
 	items, ok = eipData["items"].([]interface{})
 	if ok {
 		for _, item := range items {
@@ -755,6 +758,9 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 				continue
 			}
 
+			// Check if this EIP resource has any IPs assigned to this node
+			// First IP from each resource counts as Primary
+			hasIPOnNode := false
 			for _, statusItem := range statusItems {
 				statusItemMap, ok := statusItem.(map[string]interface{})
 				if !ok {
@@ -780,19 +786,29 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 				}
 
 				if nodeStr == nodeName {
-					eipAssigned++
+					if !hasIPOnNode {
+						hasIPOnNode = true
+						primaryEIPs++
+					}
 				}
 			}
 		}
 	}
 
+	// Secondary EIPs = remaining IPs (CPIC Success - Primary EIPs)
+	secondaryEIPs := 0
+	if cpicSuccess > primaryEIPs {
+		secondaryEIPs = cpicSuccess - primaryEIPs
+	}
+
 	return &NodeStats{
-		CPICSuccess: cpicSuccess,
-		CPICPending: cpicPending,
-		CPICError:   cpicError,
-		EIPAssigned: eipAssigned,
-		AzureEIPs:   0, // Will be filled by Azure client
-		AzureLBs:    0, // Will be filled by Azure client
+		CPICSuccess:   cpicSuccess,
+		CPICPending:   cpicPending,
+		CPICError:     cpicError,
+		EIPAssigned:   primaryEIPs,
+		SecondaryEIPs: secondaryEIPs,
+		AzureEIPs:     0, // Will be filled by Azure client
+		AzureLBs:      0, // Will be filled by Azure client
 	}, nil
 }
 
@@ -962,15 +978,16 @@ const (
 )
 
 type NodeEIPData struct {
-	Node        string
-	EIPAssigned int
-	AzureEIPs   int
-	AzureLBs    int
-	CPICSuccess int
-	CPICPending int
-	CPICError   int
-	Capacity    int        // IP capacity from node annotations
-	Status      NodeStatus // Node readiness status
+	Node          string
+	EIPAssigned   int // Primary EIPs (first IP from each EIP resource on this node)
+	SecondaryEIPs int // Secondary EIPs (remaining IPs: CPIC Success - Primary)
+	AzureEIPs     int
+	AzureLBs      int
+	CPICSuccess   int
+	CPICPending   int
+	CPICError     int
+	Capacity      int        // IP capacity from node annotations
+	Status        NodeStatus // Node readiness status
 }
 
 func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData {
@@ -1026,15 +1043,16 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 	// Don't log here - will log after sorting in MonitorLoop
 
 	return &NodeEIPData{
-		Node:        node,
-		EIPAssigned: nodeStats.EIPAssigned,
-		AzureEIPs:   azureEIPs,
-		AzureLBs:    azureLBs,
-		CPICSuccess: nodeStats.CPICSuccess,
-		CPICPending: nodeStats.CPICPending,
-		CPICError:   nodeStats.CPICError,
-		Capacity:    capacity,
-		Status:      nodeStatus,
+		Node:          node,
+		EIPAssigned:   nodeStats.EIPAssigned,
+		SecondaryEIPs: nodeStats.SecondaryEIPs,
+		AzureEIPs:     azureEIPs,
+		AzureLBs:      azureLBs,
+		CPICSuccess:   nodeStats.CPICSuccess,
+		CPICPending:   nodeStats.CPICPending,
+		CPICError:     nodeStats.CPICError,
+		Capacity:      capacity,
+		Status:        nodeStatus,
 	}
 }
 
@@ -1221,6 +1239,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Use red highlighting for CPIC errors
 			cpicErrorStr := formatValueError(data.CPICError, prev != nil && prev.CPICError != data.CPICError, isTerminal)
 			eipStr := formatValue(data.EIPAssigned, prev != nil && prev.EIPAssigned != data.EIPAssigned, isTerminal)
+			secondaryEIPStr := formatValue(data.SecondaryEIPs, prev != nil && prev.SecondaryEIPs != data.SecondaryEIPs, isTerminal)
 			azureEIPsStr := formatValue(data.AzureEIPs, prev != nil && prev.AzureEIPs != data.AzureEIPs, isTerminal)
 			azureLBsStr := formatValue(data.AzureLBs, prev != nil && prev.AzureLBs != data.AzureLBs, isTerminal)
 
@@ -1228,11 +1247,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Always show capacity, even if unknown (show as "?")
 			capacityStr := ""
 			if data.Capacity > 0 {
-				availableCapacity := data.Capacity - data.EIPAssigned
+				totalAssigned := data.EIPAssigned + data.SecondaryEIPs
+				availableCapacity := data.Capacity - totalAssigned
 				if availableCapacity < 0 {
 					availableCapacity = 0 // Don't show negative
 				}
-				capacityChanged := prev != nil && (prev.Capacity != data.Capacity || prev.EIPAssigned != data.EIPAssigned)
+				capacityChanged := prev != nil && (prev.Capacity != data.Capacity || prev.EIPAssigned != data.EIPAssigned || prev.SecondaryEIPs != data.SecondaryEIPs)
 				capacityStr = fmt.Sprintf(", Capacity: %s/%d",
 					formatValue(availableCapacity, capacityChanged, isTerminal),
 					data.Capacity)
@@ -1244,9 +1264,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Format node name with color based on status
 			nodeNameStr := formatNodeName(data.Node, data.Status, isTerminal)
 
-			fmt.Printf("%s%s - CPIC: %s/%s/%s, EIP: %s, Azure: %s/%s%s\n",
+			fmt.Printf("%s%s - CPIC: %s/%s/%s, Primary EIPs: %s, Secondary EIPs: %s, Azure: %s/%s%s\n",
 				clearLine, nodeNameStr, cpicSuccessStr, cpicPendingStr, cpicErrorStr,
-				eipStr, azureEIPsStr, azureLBsStr, capacityStr)
+				eipStr, secondaryEIPStr, azureEIPsStr, azureLBsStr, capacityStr)
 
 			// Store current values for next iteration
 			if !hasPrev {
@@ -1286,15 +1306,16 @@ func (em *EIPMonitor) MonitorLoop() error {
 		}
 
 		// Calculate assigned EIPs by summing per-node counts (to ensure consistency)
-		assignedFromNodes := 0
+		// Total assigned = Primary + Secondary across all nodes
+		totalAssignedEIPs := 0
 		for _, data := range nodeData {
-			assignedFromNodes += data.EIPAssigned
+			totalAssignedEIPs += data.EIPAssigned + data.SecondaryEIPs
 		}
 
 		// Format summary stats with highlighting
 		configuredStr := formatValue(eipStats.Configured, prevSummary.initialized && prevSummary.configured != eipStats.Configured, isTerminal)
 		successfulStr := formatValue(cpicStats.Success, prevSummary.initialized && prevSummary.successful != cpicStats.Success, isTerminal)
-		assignedStr := formatValue(assignedFromNodes, prevSummary.initialized && prevSummary.assigned != assignedFromNodes, isTerminal)
+		assignedStr := formatValue(totalAssignedEIPs, prevSummary.initialized && prevSummary.assigned != totalAssignedEIPs, isTerminal)
 
 		// Format CNCC stats with highlighting
 		cnccRunningStr := formatValue(cnccStats.PodsRunning, prevSummary.initialized && prevSummary.cnccRunning != cnccStats.PodsRunning, isTerminal)
@@ -1305,10 +1326,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 		}
 
 		// Format total capacity: show available/total (available = total - assigned)
-		// Use assignedFromNodes for consistency with displayed value
+		// Use totalAssignedEIPs for consistency with displayed value
 		capacityStr := ""
 		if clusterCapacity > 0 {
-			availableCapacity := clusterCapacity - assignedFromNodes
+			availableCapacity := clusterCapacity - totalAssignedEIPs
 			if availableCapacity < 0 {
 				availableCapacity = 0 // Don't show negative
 			}
@@ -1355,8 +1376,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 		} else {
 			// Check for progress in EIP assignment and CPIC status
 			if !progressTracker.baselineSet {
-				// Set baseline for progress tracking (use assignedFromNodes for consistency)
-				progressTracker.baselineEIPAssigned = assignedFromNodes
+				// Set baseline for progress tracking (use totalAssignedEIPs for consistency)
+				progressTracker.baselineEIPAssigned = totalAssignedEIPs
 				progressTracker.baselineCPICSuccess = cpicStats.Success
 				progressTracker.baselineCPICPending = cpicStats.Pending
 				for _, data := range nodeData {
@@ -1369,8 +1390,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 				// Check if there's been any progress
 				progressMade := false
 
-				// Check EIP assignment progress (use assignedFromNodes for consistency)
-				if assignedFromNodes > progressTracker.baselineEIPAssigned {
+				// Check EIP assignment progress (use totalAssignedEIPs for consistency)
+				if totalAssignedEIPs > progressTracker.baselineEIPAssigned {
 					progressMade = true
 				}
 
@@ -1399,10 +1420,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 				}
 
 				if progressMade {
-					// Progress detected, reset counter and update baseline (use assignedFromNodes for consistency)
+					// Progress detected, reset counter and update baseline (use totalAssignedEIPs for consistency)
 					progressTracker.iterationsWithoutProgress = 0
 					progressTracker.warningShown = false
-					progressTracker.baselineEIPAssigned = assignedFromNodes
+					progressTracker.baselineEIPAssigned = totalAssignedEIPs
 					progressTracker.baselineCPICSuccess = cpicStats.Success
 					progressTracker.baselineCPICPending = cpicStats.Pending
 					for _, data := range nodeData {
@@ -1428,10 +1449,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		// Store current summary for next iteration (use assignedFromNodes for consistency)
+		// Store current summary for next iteration (use totalAssignedEIPs for consistency)
 		prevSummary.configured = eipStats.Configured
 		prevSummary.successful = cpicStats.Success
-		prevSummary.assigned = assignedFromNodes
+		prevSummary.assigned = totalAssignedEIPs
 		prevSummary.cpicError = cpicStats.Error
 		prevSummary.cnccRunning = cnccStats.PodsRunning
 		prevSummary.cnccReady = cnccStats.PodsReady
