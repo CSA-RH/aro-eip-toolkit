@@ -1,6 +1,6 @@
-# EIP Toolkit - Go Implementation
+# EIP Toolkit
 
-Go toolkit for monitoring Azure Red Hat OpenShift Egress IP assignments and CloudPrivateIPConfig status.
+Monitors Azure Red Hat OpenShift Egress IP assignments and CloudPrivateIPConfig status.
 
 ## Installation
 
@@ -108,13 +108,13 @@ Data Flow:
 EIPMonitor → Log Files → DataProcessor → Data Files (.dat) → PlotGenerator → PNG Plots
 ```
 
-### Core Components
+### Components
 
 - **OpenShiftClient**: Executes `oc` commands, queries EIP and CPIC resources with caching
 - **AzureClient**: Executes `az` commands, queries NIC statistics
 - **EIPMonitor**: Main monitoring loop, collects and logs statistics with parallel processing
-- **SmartCache**: TTL-based caching with LRU eviction
-- **BufferedLogger**: Buffered file I/O for performance
+- **Cache**: TTL-based caching with LRU eviction
+- **BufferedLogger**: Buffered file I/O
 - **DataProcessor**: Merges log files into structured data files
 - **PlotGenerator**: Reads data files and generates PNG plots using gonum/plot
 
@@ -197,16 +197,16 @@ User
 
 ### Monitoring Output
 
-The monitoring command displays real-time statistics with:
-- **Timestamp**: Each iteration shows the current timestamp at the top
-- **Node Statistics**: Per-node CPIC (success/pending/error), Primary EIPs, Secondary EIPs, and Azure NIC stats
-- **Summary Stats**: Single-line summary showing Configured EIPs, Successful CPICs, Assigned EIPs, Malfunction EIPs, Overcommitted EIPs, and CNCC status
-- **Value Highlighting**: Values that change between iterations are highlighted in yellow/bold
-- **In-place Updates**: Console output overwrites previous lines using ANSI escape codes (when output is to a terminal)
-- **Warnings**: After 10 iterations without progress, displays:
-  - EIP/CPIC mismatches (if any detected)
-  - Unassigned EIPs (if any detected)
-  - CPIC errors (if any detected)
+The monitoring command displays:
+- Timestamp at the top of each iteration
+- Per-node statistics: CPIC (success/pending/error), Primary EIPs, Secondary EIPs, Azure NIC stats
+- Cluster summary: Configured EIPs, Successful CPICs, Assigned EIPs, Malfunction EIPs, Overcommitted EIPs, CNCC status
+- Changed values highlighted in yellow/bold
+- Output overwrites previous lines using ANSI escape codes (terminal only)
+- After 10 iterations without progress:
+  - EIP/CPIC mismatches
+  - Unassigned EIPs
+  - CPIC errors
 
 Example output:
 ```
@@ -216,12 +216,12 @@ aro-worker-node2 - CPIC: 33/0/0, Primary EIPs: 31, Secondary EIPs: 2, Azure: 33/
 Cluster Summary: Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 445/510
 ```
 
-**Key Metrics Explained:**
-- **Primary EIPs**: The first IP in the `status.items` list of each EIP resource assigned to the node. Each EIP resource contributes at most one Primary EIP.
-- **Secondary EIPs**: Additional IPs from the same EIP resource assigned to the node. Calculated as `CPIC Success - Primary EIPs`.
-- **Assigned EIPs**: Total assigned IPs (Primary + Secondary) across all nodes. Should match CPIC Success count.
-- **Malfunction EIPs**: EIP resources where IPs in `status.items` don't match CPIC assignments (node mismatches or missing in EIP status). Displayed in **red** if > 0.
-- **Overcommitted EIPs**: EIP resources that have more IPs configured than available nodes (cannot all be assigned). Displayed in **yellow** if > 0.
+**Metrics:**
+- **Primary EIPs**: First IP in `status.items` of each EIP resource assigned to the node. Each EIP resource contributes at most one Primary EIP.
+- **Secondary EIPs**: Additional IPs from the same EIP resource. Calculated as `CPIC Success - Primary EIPs`.
+- **Assigned EIPs**: Total assigned IPs (Primary + Secondary). Should match CPIC Success count.
+- **Malfunction EIPs**: EIP resources where `status.items` don't match CPIC assignments. Red if > 0.
+- **Overcommitted EIPs**: EIP resources with more IPs configured than available nodes. Yellow if > 0.
 
 ### Monitoring Logic
 
@@ -232,18 +232,17 @@ Monitoring loop continues while:
 Where `expectedAssignable = Configured - unassignableIPs` (accounting for overcommitted EIPs).
 
 **Overcommitment Handling:**
-- EIP resources with more IPs configured than available nodes cannot assign all IPs
-- The monitoring logic accounts for this by calculating how many IPs are legitimately unassignable
-- Monitoring exits when all assignable IPs are assigned (not all configured IPs)
+- EIP resources with more IPs than available nodes cannot assign all IPs
+- Monitoring calculates unassignable IPs and exits when all assignable IPs are assigned
 
 **Mismatch Detection:**
-- EIP/CPIC mismatches are detected only after 10 iterations without progress
-- Overcommitted EIP resources are excluded from mismatch detection to avoid false positives
-- Detailed mismatch IP lists are shown only after 10 iterations without progress and hidden immediately when progress is detected
+- Detected after 10 iterations without progress
+- Overcommitted EIP resources excluded to avoid false positives
+- Detailed IP lists shown after 10 iterations, hidden when progress detected
 
 **Unassigned EIP Detection:**
-- Unassigned EIPs are detected only after 10 iterations without progress
-- Only shown if no mismatches are already detected (to avoid duplicate reporting)
+- Detected after 10 iterations without progress
+- Only shown if no mismatches detected (to avoid duplicate reporting)
 
 ### Logged Metrics
 
@@ -272,15 +271,14 @@ The following metrics are logged to files for tracking and plotting:
 - `eip_cpic_mismatches_node_mismatch.log` - Node assignment mismatches
 - `eip_cpic_mismatches_missing_in_eip.log` - IPs in CPIC but not in EIP status
 
-### Go-Specific Features
+### Implementation Details
 
-- **Goroutines**: Parallel node data collection using goroutines and semaphores
-- **SmartCache**: Thread-safe caching with TTL and LRU eviction
-- **BufferedLogger**: Concurrent-safe buffered file I/O
-- **Error Handling**: Custom error types with proper error wrapping
-- **Real-time Console Updates**: ANSI escape codes for in-place output overwriting (terminal-aware)
-- **Value Change Highlighting**: Visual feedback for metrics that change between iterations
-- **Terminal Detection**: Automatically detects if output is to a terminal and adjusts formatting accordingly
-- **Progress Tracking**: Tracks iterations without progress to conditionally display detailed warnings
-- **Mismatch Detection**: Detects inconsistencies between EIP and CPIC node assignments
-- **Overcommitment Detection**: Identifies EIP resources with more IPs than available nodes
+- Parallel node data collection using goroutines and semaphores
+- Thread-safe caching with TTL and LRU eviction
+- Concurrent-safe buffered file I/O
+- Custom error types with error wrapping
+- ANSI escape codes for in-place output overwriting (terminal-aware)
+- Terminal detection for formatting adjustments
+- Progress tracking for conditional warning display
+- Mismatch detection between EIP and CPIC node assignments
+- Overcommitment detection for EIP resources with more IPs than available nodes
