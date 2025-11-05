@@ -1676,13 +1676,9 @@ func (oc *OpenShiftClient) DetectUnassignedEIPs() ([]UnassignedEIP, error) {
 	return unassigned, nil
 }
 
-func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
-	// Get CPIC stats for the node
-	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
-	if err != nil {
-		return nil, err
-	}
-
+// GetNodeStatsFromData computes node stats from pre-fetched EIP and CPIC data
+// This is more efficient than GetNodeStats when data is already available
+func (oc *OpenShiftClient) GetNodeStatsFromData(nodeName string, eipData, cpicData map[string]interface{}) (*NodeStats, error) {
 	cpicSuccess := 0
 	cpicPending := 0
 	cpicError := 0
@@ -1757,12 +1753,6 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	// Primary EIP = the first IP in status.items of each EIP resource
 	// Each EIP resource contributes exactly ONE Primary EIP (the first IP in its status.items)
 	// Secondary EIPs = CPIC Success - Primary EIPs
-
-	// First, get EIP resources and their configured IPs to map IP -> resource
-	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
-	if err != nil {
-		return nil, err
-	}
 
 	// Build IP -> EIP resource map from spec.egressIPs
 	ipToEIPResource := make(map[string]string)
@@ -2047,6 +2037,17 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	}, nil
 }
 
+// GetNodeStats fetches EIP and CPIC data and computes node stats
+// For better performance when data is already available, use GetNodeStatsFromData instead
+func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
+	// Fetch EIP and CPIC data
+	eipData, cpicData, err := oc.FetchEIPAndCPICData()
+	if err != nil {
+		return nil, err
+	}
+	return oc.GetNodeStatsFromData(nodeName, eipData, cpicData)
+}
+
 // AzureClient handles Azure CLI operations
 type AzureClient struct {
 	subscriptionID string
@@ -2281,8 +2282,16 @@ type NodeEIPData struct {
 	Status        NodeStatus // Node readiness status
 }
 
-func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData {
-	nodeStats, err := em.ocClient.GetNodeStats(node)
+func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpicData map[string]interface{}) *NodeEIPData {
+	var nodeStats *NodeStats
+	var err error
+	if eipData != nil && cpicData != nil {
+		// Use pre-fetched data for better performance
+		nodeStats, err = em.ocClient.GetNodeStatsFromData(node, eipData, cpicData)
+	} else {
+		// Fallback to fetching data (for backward compatibility)
+		nodeStats, err = em.ocClient.GetNodeStats(node)
+	}
 	if err != nil {
 		log.Printf("Error monitoring node %s: %v", node, err)
 		return nil
@@ -2349,7 +2358,7 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string) *NodeEIPData
 	}
 }
 
-func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) []*NodeEIPData {
+func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string, eipData, cpicData map[string]interface{}) []*NodeEIPData {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	results := make([]*NodeEIPData, 0, len(nodes))
@@ -2368,7 +2377,7 @@ func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string) 
 			sem <- struct{}{}        // Acquire semaphore
 			defer func() { <-sem }() // Release semaphore
 
-			data := em.CollectSingleNodeData(n, timestamp)
+			data := em.CollectSingleNodeData(n, timestamp, eipData, cpicData)
 			if data != nil {
 				mu.Lock()
 				results = append(results, data)
@@ -2555,8 +2564,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 			"count": overcommittedEIPs,
 		})
 
-		// Collect node data in parallel
-		nodeData := em.CollectNodeDataParallel(nodes, timestamp)
+		// Collect node data in parallel (using pre-fetched EIP and CPIC data for better performance)
+		nodeData := em.CollectNodeDataParallel(nodes, timestamp, eipData, cpicData)
 
 		// Check if stdout is a terminal (for ANSI escape codes)
 		isTerminal := term.IsTerminal(int(os.Stdout.Fd()))
@@ -4430,14 +4439,18 @@ func PrintCurrentState() error {
 	malfunctioningEIPs, _ := ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
 	overcommittedEIPs, _ := ocClient.CountOvercommittedEIPObjects(eipData)
 
-	// Collect node data
+	// Collect node data (using pre-fetched EIP and CPIC data for better performance)
 	var wg sync.WaitGroup
 	nodeData := make([]*NodeEIPData, len(nodes))
 	for i, node := range nodes {
 		wg.Add(1)
 		go func(idx int, nodeName string) {
 			defer wg.Done()
-			nodeStats, _ := ocClient.GetNodeStats(nodeName)
+			nodeStats, err := ocClient.GetNodeStatsFromData(nodeName, eipData, cpicData)
+			if err != nil || nodeStats == nil {
+				// Use zero values if stats can't be retrieved
+				nodeStats = &NodeStats{}
+			}
 			azureEIPs, azureLBs, _ := azClient.GetNodeNICStats(nodeName)
 			capacity, _ := ocClient.GetNodeCapacity(nodeName)
 			// Get node status
