@@ -318,7 +318,7 @@ func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
 			}
 		}
 
-		// Count assigned IPs from status.items (each item represents an assigned IP)
+		// Count assigned IPs from status.items (only count items with node assigned)
 		status, ok := itemMap["status"].(map[string]interface{})
 		if !ok {
 			continue
@@ -326,7 +326,17 @@ func (oc *OpenShiftClient) GetEIPStats() (*EIPStats, error) {
 
 		statusItems, ok := status["items"].([]interface{})
 		if ok {
-			assigned += len(statusItems)
+			// Only count items that have a node assigned (actually assigned)
+			for _, statusItem := range statusItems {
+				statusItemMap, ok := statusItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				nodeValue, hasNode := statusItemMap["node"]
+				if hasNode && nodeValue != nil {
+					assigned++
+				}
+			}
 		}
 	}
 
@@ -590,25 +600,34 @@ func (oc *OpenShiftClient) GetIPToNodeMapping() (map[string]string, error) {
 			continue
 		}
 
+		// Get IP address - try spec.ip first, fall back to resource name
+		var ipStr string
 		spec, ok := itemMap["spec"].(map[string]interface{})
-		if !ok {
-			continue
+		if ok {
+			ipValue, ok := spec["ip"]
+			if ok {
+				switch v := ipValue.(type) {
+				case string:
+					ipStr = v
+				case nil:
+					// spec.ip is null, try resource name
+					break
+				default:
+					ipStr = fmt.Sprintf("%v", v)
+				}
+			}
 		}
 
-		// Get the IP address
-		ipValue, ok := spec["ip"]
-		if !ok {
-			continue
+		// If spec.ip is null or empty, try using the resource name as the IP
+		if ipStr == "" {
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			if ok {
+				if name, ok := metadata["name"].(string); ok && name != "" {
+					ipStr = name
+				}
+			}
 		}
-		ipStr := ""
-		switch v := ipValue.(type) {
-		case string:
-			ipStr = v
-		case nil:
-			continue
-		default:
-			ipStr = fmt.Sprintf("%v", v)
-		}
+
 		if ipStr == "" {
 			continue
 		}
@@ -652,6 +671,637 @@ func (oc *OpenShiftClient) GetIPToNodeMapping() (map[string]string, error) {
 	}
 
 	return ipToNode, nil
+}
+
+// EIPCPICMismatch represents a mismatch between EIP status and CPIC status
+type EIPCPICMismatch struct {
+	IP           string
+	EIPNode      string // Node from EIP status
+	CPICNode     string // Node from CPIC status
+	EIPResource  string // EIP resource name/namespace
+	MismatchType string // "node_mismatch", "missing_in_cpic", "missing_in_eip"
+}
+
+// UnassignedEIP represents an EIP that is configured but not assigned
+type UnassignedEIP struct {
+	IP         string
+	Resource   string // EIP resource name/namespace
+	Reason     string // Why it's not assigned
+	CPICStatus string // CPIC status if available (pending, error, missing)
+	CPICReason string // CPIC condition reason if available
+}
+
+// DetectEIPCPICMismatches compares EIP status.items node assignments with CPIC CloudResponseSuccess assignments
+// Returns a list of mismatches where the same IP is assigned to different nodes
+func (oc *OpenShiftClient) DetectEIPCPICMismatches() ([]EIPCPICMismatch, error) {
+	var mismatches []EIPCPICMismatch
+
+	// Get CPIC IP->node mapping (already exists)
+	cpicIPToNode, err := oc.GetIPToNodeMapping()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get CPIC IP to node mapping: %w", err)
+	}
+
+	// Get EIP data and build EIP IP->node mapping
+	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get EIP data: %w", err)
+	}
+
+	// Build EIP IP->node mapping
+	// EIP structure: spec.egressIPs[i] should correspond to status.items[i]
+	eipIPToNode := make(map[string]string)
+	eipIPToResource := make(map[string]string)
+
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return mismatches, nil
+	}
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get EIP resource name/namespace
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		// Get configured IPs from spec.egressIPs
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		var configuredIPs []string
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ip := range egressIPs {
+					if ipStr, ok := ip.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+		}
+
+		// Get assigned IPs from status.items
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		statusItems, ok := status["items"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		// Map each status.item to its IP and node
+		// First try to get IP directly from status.item (if it has an egressIP field)
+		// Otherwise, fall back to positional mapping with spec.egressIPs
+		for i, statusItem := range statusItems {
+			statusItemMap, ok := statusItem.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Get node from status.item
+			nodeValue, ok := statusItemMap["node"]
+			if !ok {
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			if nodeStr == "" {
+				continue
+			}
+
+			// Try to get IP directly from status.item (egressIP field)
+			var ip string
+			if egressIPValue, hasIP := statusItemMap["egressIP"]; hasIP {
+				switch v := egressIPValue.(type) {
+				case string:
+					ip = v
+				default:
+					ip = fmt.Sprintf("%v", v)
+				}
+			} else {
+				// Fall back to positional mapping if egressIP field doesn't exist
+				if i < len(configuredIPs) {
+					ip = configuredIPs[i]
+				} else {
+					continue // Skip if no IP can be determined
+				}
+			}
+
+			if ip == "" {
+				continue
+			}
+
+			eipIPToNode[ip] = nodeStr
+			eipIPToResource[ip] = resourceName
+		}
+	}
+
+	// Compare EIP and CPIC mappings
+	// Flag actual node assignment mismatches (where same IP is on different nodes)
+	// Also flag IPs in CPIC with CloudResponseSuccess but not in EIP status.items
+	for ip, eipNode := range eipIPToNode {
+		cpicNode, existsInCPIC := cpicIPToNode[ip]
+		if existsInCPIC && eipNode != cpicNode {
+			// IP assigned to different nodes - this is a real mismatch
+			mismatches = append(mismatches, EIPCPICMismatch{
+				IP:           ip,
+				EIPNode:      eipNode,
+				CPICNode:     cpicNode,
+				EIPResource:  eipIPToResource[ip],
+				MismatchType: "node_mismatch",
+			})
+		}
+	}
+
+	// Check for IPs in CPIC (CloudResponseSuccess) but not in EIP status.items
+	// This indicates CPIC succeeded but EIP status hasn't been updated
+	// Try to find which EIP resource this IP belongs to by checking spec.egressIPs
+	eipResourceMap := make(map[string]string) // IP -> resource name
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ipVal := range egressIPs {
+					if ipStr, ok := ipVal.(string); ok {
+						eipResourceMap[ipStr] = resourceName
+					}
+				}
+			}
+		}
+	}
+
+	// Check for IPs in CPIC with CloudResponseSuccess but not in EIP status.items
+	// This indicates CPIC succeeded but EIP status hasn't been updated
+	for ip, cpicNode := range cpicIPToNode {
+		_, existsInEIP := eipIPToNode[ip]
+		if !existsInEIP {
+			// IP is in CPIC with CloudResponseSuccess but not in EIP status.items
+			// This is a mismatch - CPIC shows it's assigned but EIP doesn't
+			resourceName := eipResourceMap[ip]
+			mismatches = append(mismatches, EIPCPICMismatch{
+				IP:           ip,
+				EIPNode:      "",
+				CPICNode:     cpicNode,
+				EIPResource:  resourceName,
+				MismatchType: "missing_in_eip",
+			})
+		}
+	}
+
+	// Also check IPs that are configured in EIP spec.egressIPs but missing from EIP status.items
+	// If they have a CPIC with a node assigned (regardless of status), it's a mismatch
+	cpicAllData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
+	if err == nil {
+		cpicAllItems, ok := cpicAllData["items"].([]interface{})
+		if ok {
+			// Build map of all CPIC IPs with node assignments
+			cpicAllIPToNode := make(map[string]string)
+			for _, item := range cpicAllItems {
+				itemMap, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// Get IP address - try spec.ip first, fall back to resource name
+				var ipStr string
+				spec, ok := itemMap["spec"].(map[string]interface{})
+				if ok {
+					ipValue, ok := spec["ip"]
+					if ok {
+						switch v := ipValue.(type) {
+						case string:
+							ipStr = v
+						case nil:
+							// spec.ip is null, try resource name
+							break
+						default:
+							ipStr = fmt.Sprintf("%v", v)
+						}
+					}
+				}
+
+				// If spec.ip is null or empty, try using the resource name as the IP
+				if ipStr == "" {
+					metadata, ok := itemMap["metadata"].(map[string]interface{})
+					if ok {
+						if name, ok := metadata["name"].(string); ok && name != "" {
+							ipStr = name
+						}
+					}
+				}
+
+				if ipStr == "" {
+					continue
+				}
+
+				nodeValue, ok := spec["node"]
+				if !ok {
+					continue
+				}
+				nodeStr := ""
+				switch v := nodeValue.(type) {
+				case string:
+					nodeStr = v
+				case nil:
+					continue
+				default:
+					nodeStr = fmt.Sprintf("%v", v)
+				}
+				if nodeStr != "" {
+					cpicAllIPToNode[ipStr] = nodeStr
+				}
+			}
+
+			// Check IPs configured in EIP spec but not in EIP status.items
+			for ip, resourceName := range eipResourceMap {
+				_, existsInEIPStatus := eipIPToNode[ip]
+				if !existsInEIPStatus {
+					// IP is configured in EIP spec but not in EIP status.items
+					// Check if it has a CPIC with node assignment
+					if cpicNode, hasCPICNode := cpicAllIPToNode[ip]; hasCPICNode {
+						// IP has CPIC with node assignment but not in EIP status.items - mismatch
+						// Check if we already reported this IP (from CloudResponseSuccess check above)
+						alreadyReported := false
+						for _, m := range mismatches {
+							if m.IP == ip && m.MismatchType == "missing_in_eip" {
+								alreadyReported = true
+								break
+							}
+						}
+						if !alreadyReported {
+							mismatches = append(mismatches, EIPCPICMismatch{
+								IP:           ip,
+								EIPNode:      "",
+								CPICNode:     cpicNode,
+								EIPResource:  resourceName,
+								MismatchType: "missing_in_eip",
+							})
+						}
+					}
+				}
+			}
+
+			// Also check IPs in CPIC with node assignment but not in EIP status.items
+			// (This catches cases where IP might not be in eipResourceMap but is in CPIC)
+			for ip, cpicNode := range cpicAllIPToNode {
+				_, existsInEIPStatus := eipIPToNode[ip]
+				if !existsInEIPStatus {
+					// IP is in CPIC with node assignment but not in EIP status.items
+					// Check if we already reported this IP
+					alreadyReported := false
+					for _, m := range mismatches {
+						if m.IP == ip && m.MismatchType == "missing_in_eip" {
+							alreadyReported = true
+							break
+						}
+					}
+					if !alreadyReported {
+						resourceName := eipResourceMap[ip]
+						mismatches = append(mismatches, EIPCPICMismatch{
+							IP:           ip,
+							EIPNode:      "",
+							CPICNode:     cpicNode,
+							EIPResource:  resourceName,
+							MismatchType: "missing_in_eip",
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return mismatches, nil
+}
+
+// DetectUnassignedEIPs finds EIPs that are configured but not assigned, and determines why
+// Uses the same logic as GetEIPStats: configured = len(spec.egressIPs), assigned = len(status.items with node)
+func (oc *OpenShiftClient) DetectUnassignedEIPs() ([]UnassignedEIP, error) {
+	var unassigned []UnassignedEIP
+
+	// Get EIP data
+	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get EIP data: %w", err)
+	}
+
+	// Get CPIC data to check status of unassigned IPs
+	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get CPIC data: %w", err)
+	}
+
+	// Build CPIC status map (IP -> status info)
+	cpicStatus := make(map[string]map[string]string) // IP -> {"status": "...", "reason": "..."}
+	cpicItems, ok := cpicData["items"].([]interface{})
+	if ok {
+		for _, item := range cpicItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			ipValue, ok := spec["ip"]
+			if !ok {
+				continue
+			}
+
+			var ipStr string
+			switch v := ipValue.(type) {
+			case string:
+				ipStr = v
+			default:
+				ipStr = fmt.Sprintf("%v", v)
+			}
+
+			if ipStr == "" {
+				continue
+			}
+
+			// Check CPIC status conditions
+			status, ok := itemMap["status"].(map[string]interface{})
+			if ok {
+				conditions, ok := status["conditions"].([]interface{})
+				if ok {
+					for _, cond := range conditions {
+						condMap, ok := cond.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						reason, _ := condMap["reason"].(string)
+						statusStr, _ := condMap["status"].(string)
+						message, _ := condMap["message"].(string)
+
+						// Determine CPIC status
+						var cpicStatusVal, cpicReason string
+						switch reason {
+						case "CloudResponseSuccess":
+							cpicStatusVal = "success"
+						case "CloudResponsePending":
+							cpicStatusVal = "pending"
+							cpicReason = message
+						case "CloudResponseError":
+							cpicStatusVal = "error"
+							cpicReason = message
+						default:
+							if statusStr != "" {
+								cpicStatusVal = statusStr
+								cpicReason = message
+							}
+						}
+
+						if cpicStatusVal != "" {
+							cpicStatus[ipStr] = map[string]string{
+								"status": cpicStatusVal,
+								"reason": cpicReason,
+							}
+							break
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Analyze EIP resources
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return unassigned, nil
+	}
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get resource name
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		// Get configured IPs
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		var configuredIPs []string
+		if ok {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ip := range egressIPs {
+					if ipStr, ok := ip.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+		}
+
+		// Count assigned IPs from status.items (same logic as GetEIPStats)
+		// Each status.item with a node represents an assigned IP
+		// Skip resources without status (same as GetEIPStats)
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue // Skip resources without status (GetEIPStats does this too)
+		}
+
+		assignedCount := 0
+		assignedIPs := make(map[string]bool)
+		statusItems, ok := status["items"].([]interface{})
+		if ok {
+			// Count items that have a node assigned
+			for i, statusItem := range statusItems {
+				statusItemMap, ok := statusItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// Check if this status item has a node assigned
+				nodeValue, hasNode := statusItemMap["node"]
+				if !hasNode || nodeValue == nil {
+					continue // Skip items without node assignment
+				}
+
+				assignedCount++
+
+				// Try to identify the IP for this status item
+				var ip string
+				if egressIPValue, hasIP := statusItemMap["egressIP"]; hasIP {
+					switch v := egressIPValue.(type) {
+					case string:
+						ip = v
+					default:
+						ip = fmt.Sprintf("%v", v)
+					}
+				} else {
+					// Fall back to positional mapping if egressIP field doesn't exist
+					if i < len(configuredIPs) {
+						ip = configuredIPs[i]
+					}
+				}
+
+				if ip != "" {
+					assignedIPs[ip] = true
+				}
+			}
+		}
+
+		// Calculate unassigned count (same as GetEIPStats logic)
+		configuredCount := len(configuredIPs)
+		unassignedCount := configuredCount - assignedCount
+
+		// Check EIP status conditions for more context
+		var eipConditionReason string
+		if status != nil {
+			conditions, ok := status["conditions"].([]interface{})
+			if ok {
+				for _, cond := range conditions {
+					condMap, ok := cond.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					typeStr, _ := condMap["type"].(string)
+					reason, _ := condMap["reason"].(string)
+					message, _ := condMap["message"].(string)
+
+					// Look for assignment-related conditions
+					if typeStr == "Assigned" || reason != "" {
+						if reason != "" {
+							eipConditionReason = reason
+							if message != "" {
+								eipConditionReason = fmt.Sprintf("%s: %s", reason, message)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Find unassigned IPs - only report if we have fewer assigned than configured
+		// Only report up to unassignedCount per resource to avoid over-counting
+		if unassignedCount > 0 {
+			// Find which specific IPs are unassigned (limit to unassignedCount for this resource)
+			reportedForResource := 0
+			for _, ip := range configuredIPs {
+				if reportedForResource >= unassignedCount {
+					break // Stop after reporting all unassigned for this resource
+				}
+				if !assignedIPs[ip] {
+					// This IP is configured but not in assignedIPs map
+					reason := "Not in EIP status.items"
+					cpicStatusVal := "missing"
+					cpicReasonVal := ""
+
+					// Check CPIC status
+					if cpicInfo, exists := cpicStatus[ip]; exists {
+						cpicStatusVal = cpicInfo["status"]
+						cpicReasonVal = cpicInfo["reason"]
+
+						// Refine reason based on CPIC status
+						switch cpicStatusVal {
+						case "pending":
+							reason = "CPIC pending"
+							if cpicReasonVal != "" {
+								reason = fmt.Sprintf("CPIC pending: %s", cpicReasonVal)
+							}
+						case "error":
+							reason = "CPIC error"
+							if cpicReasonVal != "" {
+								reason = fmt.Sprintf("CPIC error: %s", cpicReasonVal)
+							}
+						case "success":
+							reason = "CPIC succeeded but not in EIP status"
+						}
+					} else {
+						// Check if there's an EIP condition reason
+						if eipConditionReason != "" {
+							reason = eipConditionReason
+						}
+					}
+
+					unassigned = append(unassigned, UnassignedEIP{
+						IP:         ip,
+						Resource:   resourceName,
+						Reason:     reason,
+						CPICStatus: cpicStatusVal,
+						CPICReason: cpicReasonVal,
+					})
+					reportedForResource++
+				}
+			}
+
+			// If we couldn't identify specific IPs (e.g., no egressIP field), report generic count
+			if reportedForResource < unassignedCount {
+				remaining := unassignedCount - reportedForResource
+				for i := 0; i < remaining && i < len(configuredIPs); i++ {
+					ip := configuredIPs[i]
+					if !assignedIPs[ip] {
+						unassigned = append(unassigned, UnassignedEIP{
+							IP:         ip,
+							Resource:   resourceName,
+							Reason:     "Not in EIP status.items",
+							CPICStatus: "unknown",
+							CPICReason: "",
+						})
+						reportedForResource++
+						if reportedForResource >= unassignedCount {
+							break
+						}
+					}
+				}
+			}
+		}
+		// Note: If status is not available, we skip this resource (same as GetEIPStats)
+		// This prevents false positives when status hasn't been created yet
+	}
+
+	return unassigned, nil
 }
 
 func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
@@ -732,17 +1382,56 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	}
 
 	// Get EIP stats for the node
-	// Primary EIPs = number of EIP resources that have at least one IP on this node
+	// Primary EIP = the first IP in status.items of each EIP resource
+	// Each EIP resource contributes exactly ONE Primary EIP (the first IP in its status.items)
 	// Secondary EIPs = CPIC Success - Primary EIPs
+
+	// First, get EIP resources and their configured IPs to map IP -> resource
 	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
 	if err != nil {
 		return nil, err
 	}
 
-	primaryEIPs := 0
-	items, ok = eipData["items"].([]interface{})
+	// Build IP -> EIP resource map from spec.egressIPs
+	ipToEIPResource := make(map[string]string)
+	eipItems, ok := eipData["items"].([]interface{})
 	if ok {
-		for _, item := range items {
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			var resourceName string
+			if ok {
+				name, _ := metadata["name"].(string)
+				namespace, _ := metadata["namespace"].(string)
+				if namespace != "" {
+					resourceName = fmt.Sprintf("%s/%s", namespace, name)
+				} else {
+					resourceName = name
+				}
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if ok {
+				if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+					for _, ipVal := range egressIPs {
+						if ipStr, ok := ipVal.(string); ok {
+							ipToEIPResource[ipStr] = resourceName
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Count primary EIPs: the first IP in status.items of each EIP resource
+	// Only count if that first IP is assigned to this node
+	primaryEIPs := 0
+	if ok {
+		for _, item := range eipItems {
 			itemMap, ok := item.(map[string]interface{})
 			if !ok {
 				continue
@@ -754,42 +1443,216 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 			}
 
 			statusItems, ok := status["items"].([]interface{})
+			if !ok || len(statusItems) == 0 {
+				continue
+			}
+
+			// Get the FIRST status item (Primary EIP)
+			firstStatusItem, ok := statusItems[0].(map[string]interface{})
 			if !ok {
 				continue
 			}
 
-			// Check if this EIP resource has any IPs assigned to this node
-			// First IP from each resource counts as Primary
-			hasIPOnNode := false
-			for _, statusItem := range statusItems {
-				statusItemMap, ok := statusItem.(map[string]interface{})
+			// Check if the first IP is assigned to this node
+			nodeValue, ok := firstStatusItem["node"]
+			if !ok {
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			if nodeStr == nodeName {
+				primaryEIPs++
+			}
+		}
+	}
+
+	// Also check CPIC data for EIP resources that don't have status.items yet
+	// If an EIP resource's first configured IP is in CPIC (assigned to this node) but not in EIP status.items,
+	// it should count as a Primary EIP on this node
+	cpicItems, ok := cpicData["items"].([]interface{})
+	if ok {
+		// Build map of EIP resources that already have a Primary EIP counted from status.items
+		eipResourcesWithPrimaryEIP := make(map[string]bool)
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			status, ok := itemMap["status"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			statusItems, ok := status["items"].([]interface{})
+			if !ok || len(statusItems) == 0 {
+				continue
+			}
+
+			// Get resource name
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			var resourceName string
+			if ok {
+				name, _ := metadata["name"].(string)
+				namespace, _ := metadata["namespace"].(string)
+				if namespace != "" {
+					resourceName = fmt.Sprintf("%s/%s", namespace, name)
+				} else {
+					resourceName = name
+				}
+			}
+
+			// Check if first status item has a node assigned
+			firstStatusItem, ok := statusItems[0].(map[string]interface{})
+			if ok {
+				nodeValue, ok := firstStatusItem["node"]
+				if ok && nodeValue != nil {
+					eipResourcesWithPrimaryEIP[resourceName] = true
+				}
+			}
+		}
+
+		// Check CPIC for EIP resources that don't have status.items yet
+		// Find the first configured IP from each EIP resource and check if it's in CPIC assigned to this node
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Get resource name
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			var resourceName string
+			if ok {
+				name, _ := metadata["name"].(string)
+				namespace, _ := metadata["namespace"].(string)
+				if namespace != "" {
+					resourceName = fmt.Sprintf("%s/%s", namespace, name)
+				} else {
+					resourceName = name
+				}
+			}
+
+			// Skip if this resource already has a Primary EIP counted from status.items
+			if eipResourcesWithPrimaryEIP[resourceName] {
+				continue
+			}
+
+			// Get the first configured IP from spec.egressIPs
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			var firstConfiguredIP string
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok && len(egressIPs) > 0 {
+				if ipStr, ok := egressIPs[0].(string); ok {
+					firstConfiguredIP = ipStr
+				}
+			}
+
+			if firstConfiguredIP == "" {
+				continue
+			}
+
+			// Check if this first IP is in CPIC assigned to this node
+			for _, cpicItem := range cpicItems {
+				cpicItemMap, ok := cpicItem.(map[string]interface{})
 				if !ok {
 					continue
 				}
 
-				// Compare node field - handle both string and interface{} types
-				nodeValue, ok := statusItemMap["node"]
+				cpicSpec, ok := cpicItemMap["spec"].(map[string]interface{})
 				if !ok {
 					continue
 				}
 
-				// Convert to string for comparison (handles both string and other types)
-				var nodeStr string
+				// Get IP from CPIC
+				var cpicIPStr string
+				if ipValue, ok := cpicSpec["ip"]; ok {
+					switch v := ipValue.(type) {
+					case string:
+						cpicIPStr = v
+					case nil:
+						// spec.ip is null, try resource name
+						if cpicMetadata, ok := cpicItemMap["metadata"].(map[string]interface{}); ok {
+							if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+								cpicIPStr = name
+							}
+						}
+					default:
+						cpicIPStr = fmt.Sprintf("%v", v)
+					}
+				} else {
+					// spec.ip doesn't exist, try resource name
+					if cpicMetadata, ok := cpicItemMap["metadata"].(map[string]interface{}); ok {
+						if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+							cpicIPStr = name
+						}
+					}
+				}
+
+				if cpicIPStr != firstConfiguredIP {
+					continue
+				}
+
+				// Check if assigned to this node
+				nodeValue, ok := cpicSpec["node"]
+				if !ok {
+					continue
+				}
+
+				var cpicNodeStr string
 				switch v := nodeValue.(type) {
 				case string:
-					nodeStr = v
+					cpicNodeStr = v
 				case nil:
 					continue
 				default:
-					// Try to convert other types to string
-					nodeStr = fmt.Sprintf("%v", v)
+					cpicNodeStr = fmt.Sprintf("%v", v)
 				}
 
-				if nodeStr == nodeName {
-					if !hasIPOnNode {
-						hasIPOnNode = true
-						primaryEIPs++
+				if cpicNodeStr != nodeName {
+					continue
+				}
+
+				// Check if CPIC has CloudResponseSuccess
+				cpicStatus, ok := cpicItemMap["status"].(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				conditions, ok := cpicStatus["conditions"].([]interface{})
+				if !ok {
+					continue
+				}
+
+				hasCloudResponseSuccess := false
+				for _, cond := range conditions {
+					condMap, ok := cond.(map[string]interface{})
+					if !ok {
+						continue
 					}
+					reason, _ := condMap["reason"].(string)
+					if reason == "CloudResponseSuccess" {
+						hasCloudResponseSuccess = true
+						break
+					}
+				}
+
+				if hasCloudResponseSuccess {
+					// This EIP resource's first IP is in CPIC assigned to this node but not in EIP status.items
+					primaryEIPs++
+					break // Only count once per EIP resource
 				}
 			}
 		}
@@ -1308,8 +2171,24 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// Calculate assigned EIPs by summing per-node counts (to ensure consistency)
 		// Total assigned = Primary + Secondary across all nodes
 		totalAssignedEIPs := 0
+		totalPrimaryEIPs := 0
 		for _, data := range nodeData {
 			totalAssignedEIPs += data.EIPAssigned + data.SecondaryEIPs
+			totalPrimaryEIPs += data.EIPAssigned
+		}
+
+		// Validation: Sum of Primary EIPs across nodes should not exceed number of unique EIP resources
+		// (A resource can be counted on multiple nodes if it has IPs on multiple nodes, but this is a sanity check)
+		// Get unique EIP resource count for validation
+		eipResourceCount := 0
+		if eipData, err := em.ocClient.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"}); err == nil {
+			if items, ok := eipData["items"].([]interface{}); ok {
+				eipResourceCount = len(items)
+			}
+		}
+		// Log warning if sum exceeds resource count (might indicate a bug, or legitimate multi-node resource distribution)
+		if totalPrimaryEIPs > eipResourceCount && eipResourceCount > 0 {
+			log.Printf("Warning: Sum of Primary EIPs (%d) exceeds unique EIP resource count (%d). This may indicate double-counting or legitimate multi-node resource distribution.", totalPrimaryEIPs, eipResourceCount)
 		}
 
 		// Format summary stats with highlighting
@@ -1362,6 +2241,149 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		// Track if we need to display error/warning messages
 		hasErrorMessage := false
+		var mismatchCount int
+		var mismatches []EIPCPICMismatch // Store mismatches for detailed display later
+		var unassignedCount int
+
+		// Check for EIP/CPIC mismatches
+		detectedMismatches, err := em.ocClient.DetectEIPCPICMismatches()
+		if err != nil {
+			log.Printf("Warning: Failed to detect EIP/CPIC mismatches: %v", err)
+		} else if len(detectedMismatches) > 0 {
+			mismatches = detectedMismatches
+			mismatchCount = len(mismatches)
+			// Count mismatches by type
+			nodeMismatches := 0
+			missingInEIP := 0
+			for _, m := range mismatches {
+				if m.MismatchType == "node_mismatch" {
+					nodeMismatches++
+				} else if m.MismatchType == "missing_in_eip" {
+					missingInEIP++
+				}
+			}
+
+			// Show summary always, but detailed IPs only after 10 iterations without progress
+			var parts []string
+			if nodeMismatches > 0 {
+				parts = append(parts, fmt.Sprintf("%d node mismatch(es)", nodeMismatches))
+			}
+			if missingInEIP > 0 {
+				parts = append(parts, fmt.Sprintf("%d in CPIC but not in EIP", missingInEIP))
+			}
+
+			fmt.Printf("%s\033[33;1m⚠️  EIP/CPIC Mismatch: %d IP(s) - %s\033[0m\n",
+				clearLine, len(mismatches), strings.Join(parts, ", "))
+
+			// Show detailed IPs only after 10 iterations without progress
+			// Hide immediately when progress is detected (iterationsWithoutProgress == 0 means progress was just made)
+			if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 && progressTracker.iterationsWithoutProgress > 0 {
+				// Collect and format IPs for display (limit to first 20 for readability)
+				type ipDisplay struct {
+					ip      string
+					display string
+				}
+				var nodeMismatchIPs []ipDisplay
+				var missingInEIPIPs []ipDisplay
+				maxDisplay := 20
+
+				for _, m := range mismatches {
+					if m.MismatchType == "node_mismatch" {
+						if len(nodeMismatchIPs) < maxDisplay {
+							nodeMismatchIPs = append(nodeMismatchIPs, ipDisplay{
+								ip:      m.IP,
+								display: fmt.Sprintf("%s (EIP: %s, CPIC: %s)", m.IP, m.EIPNode, m.CPICNode),
+							})
+						}
+					} else if m.MismatchType == "missing_in_eip" {
+						if len(missingInEIPIPs) < maxDisplay {
+							var display string
+							if m.EIPResource != "" {
+								display = fmt.Sprintf("%s (%s → %s)", m.IP, m.EIPResource, m.CPICNode)
+							} else {
+								display = fmt.Sprintf("%s (→ %s)", m.IP, m.CPICNode)
+							}
+							missingInEIPIPs = append(missingInEIPIPs, ipDisplay{
+								ip:      m.IP,
+								display: display,
+							})
+						}
+					}
+				}
+
+				// Sort by IP address for consistent output between iterations
+				sort.Slice(nodeMismatchIPs, func(i, j int) bool {
+					return nodeMismatchIPs[i].ip < nodeMismatchIPs[j].ip
+				})
+				sort.Slice(missingInEIPIPs, func(i, j int) bool {
+					return missingInEIPIPs[i].ip < missingInEIPIPs[j].ip
+				})
+
+				// Display detailed IPs in a readable format
+				if len(nodeMismatchIPs) > 0 {
+					displayCount := len(nodeMismatchIPs)
+					if nodeMismatches > maxDisplay {
+						fmt.Printf("%s   Node mismatches (%d shown of %d):\n", clearLine, displayCount, nodeMismatches)
+					} else {
+						fmt.Printf("%s   Node mismatches:\n", clearLine)
+					}
+					for _, item := range nodeMismatchIPs {
+						fmt.Printf("%s   - %s\n", clearLine, item.display)
+					}
+				}
+
+				if len(missingInEIPIPs) > 0 {
+					displayCount := len(missingInEIPIPs)
+					if missingInEIP > maxDisplay {
+						fmt.Printf("%s   Missing in EIP (%d shown of %d):\n", clearLine, displayCount, missingInEIP)
+					} else {
+						fmt.Printf("%s   Missing in EIP:\n", clearLine)
+					}
+					for _, item := range missingInEIPIPs {
+						fmt.Printf("%s   - %s\n", clearLine, item.display)
+					}
+				}
+			}
+
+			hasErrorMessage = true
+		}
+
+		// Check for unassigned EIPs only after 10 iterations without progress
+		// Calculate actual unassigned: Configured - Assigned (where Assigned = CPIC Success = totalAssignedEIPs)
+		// Skip unassigned detection if we already have mismatches (to avoid duplicate reporting)
+		actualUnassigned := eipStats.Configured - totalAssignedEIPs
+		if actualUnassigned > 0 && progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 && mismatchCount == 0 {
+			unassignedEIPs, err := em.ocClient.DetectUnassignedEIPs()
+			if err != nil {
+				log.Printf("Warning: Failed to detect unassigned EIPs: %v", err)
+			} else {
+				// Limit to the actual unassigned count (Configured - Assigned)
+				// Use totalAssignedEIPs (which matches CPIC Success) as source of truth
+				displayUnassigned := unassignedEIPs
+				if len(unassignedEIPs) > actualUnassigned {
+					// Only show the first N unassigned IPs where N = actualUnassigned
+					displayUnassigned = unassignedEIPs[:actualUnassigned]
+				}
+
+				if len(displayUnassigned) > 0 {
+					unassignedCount = len(displayUnassigned)
+					// Build display with IP addresses and reasons
+					var parts []string
+					for _, unassigned := range displayUnassigned {
+						if unassigned.Resource != "" {
+							parts = append(parts, fmt.Sprintf("%s (%s: %s)", unassigned.IP, unassigned.Resource, unassigned.Reason))
+						} else {
+							parts = append(parts, fmt.Sprintf("%s (%s)", unassigned.IP, unassigned.Reason))
+						}
+					}
+
+					// Use actualUnassigned (Configured - totalAssignedEIPs) as the count
+					fmt.Printf("%s\033[33;1m⚠️  Unassigned EIPs: %d IP(s) - %s\033[0m\n",
+						clearLine, actualUnassigned, strings.Join(parts, ", "))
+					hasErrorMessage = true
+				}
+			}
+		}
 
 		// Check for CPIC errors and display warning if errors are detected or increased
 		if cpicStats.Error > 0 {
@@ -1462,9 +2484,44 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// After printing N lines with \n, cursor is on line N+1 (blank line)
 		linesPrinted = 1 + len(nodeData) + 1 // timestamp + nodes + summary
 		if hasErrorMessage {
-			// Add lines for error/warning messages (CPIC error = 1 line, OVN-Kube warning = 5 lines)
+			// Add lines for error/warning messages
+			if mismatchCount > 0 {
+				linesPrinted += 1 // EIP/CPIC mismatch summary (1 line)
+				// Add lines for detailed IP display if shown (after 10 iterations without progress)
+				if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
+					// Count how many detailed lines will be printed
+					nodeMismatches := 0
+					missingInEIP := 0
+					for _, m := range mismatches {
+						if m.MismatchType == "node_mismatch" {
+							nodeMismatches++
+						} else if m.MismatchType == "missing_in_eip" {
+							missingInEIP++
+						}
+					}
+					if nodeMismatches > 0 {
+						linesPrinted += 1 // Header line
+						displayCount := nodeMismatches
+						if displayCount > 20 {
+							displayCount = 20
+						}
+						linesPrinted += displayCount // IP lines
+					}
+					if missingInEIP > 0 {
+						linesPrinted += 1 // Header line
+						displayCount := missingInEIP
+						if displayCount > 20 {
+							displayCount = 20
+						}
+						linesPrinted += displayCount // IP lines
+					}
+				}
+			}
+			if unassignedCount > 0 {
+				linesPrinted += 1 // Unassigned EIPs warning (1 line)
+			}
 			if cpicStats.Error > 0 {
-				linesPrinted += 1 // CPIC error message
+				linesPrinted += 1 // CPIC error message (1 line)
 			} else if progressTracker.iterationsWithoutProgress >= 10 && progressTracker.warningShown {
 				linesPrinted += 5 // OVN-Kube warning (5 lines: header + 4 commands)
 			}
