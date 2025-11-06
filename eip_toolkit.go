@@ -1038,7 +1038,9 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 	// Check for IPs in CPIC (CloudResponseSuccess) but not in EIP status.items
 	// This indicates CPIC succeeded but EIP status hasn't been updated
 	// Try to find which EIP resource this IP belongs to by checking spec.egressIPs
-	// Exclude overcommitted resources from this mapping
+	// Build EIP resource map (IP -> resource name) for ALL resources
+	// We need to include overcommitted resources here so we can identify and exclude their IPs
+	// when checking for mismatches (even though they're excluded from eipIPToNode)
 	eipResourceMap := make(map[string]string) // IP -> resource name
 	for _, item := range items {
 		itemMap, ok := item.(map[string]interface{})
@@ -1058,11 +1060,8 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 			}
 		}
 
-		// Skip overcommitted resources
-		if overcommittedResources[resourceName] {
-			continue
-		}
-
+		// Include ALL resources (including overcommitted) in the map
+		// This allows us to identify IPs from overcommitted resources and exclude them
 		spec, ok := itemMap["spec"].(map[string]interface{})
 		if ok {
 			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
@@ -1122,14 +1121,71 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 				}
 			} else {
 				// IP is in CPIC but we can't determine which EIP resource it belongs to
-				// Still flag as mismatch (orphaned CPIC)
-				mismatches = append(mismatches, EIPCPICMismatch{
-					IP:           ip,
-					EIPNode:      "",
-					CPICNode:     cpicNode,
-					EIPResource:  "",
-					MismatchType: "missing_in_eip",
-				})
+				// Try to find it by checking all EIP resources' spec.egressIPs
+				// If we still can't find it, it might be an orphaned CPIC, but we should be cautious
+				// about flagging it since it might be from an overcommitted resource we can't identify
+				resourceFound := false
+				if eipData != nil {
+					eipItems, ok := eipData["items"].([]interface{})
+					if ok {
+						for _, item := range eipItems {
+							itemMap, ok := item.(map[string]interface{})
+							if !ok {
+								continue
+							}
+
+							metadata, ok := itemMap["metadata"].(map[string]interface{})
+							var resName string
+							if ok {
+								name, _ := metadata["name"].(string)
+								namespace, _ := metadata["namespace"].(string)
+								if namespace != "" {
+									resName = fmt.Sprintf("%s/%s", namespace, name)
+								} else {
+									resName = name
+								}
+							}
+
+							// Skip if this resource is overcommitted
+							if resName != "" && overcommittedResources[resName] {
+								continue
+							}
+
+							spec, ok := itemMap["spec"].(map[string]interface{})
+							if ok {
+								if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+									for _, ipVal := range egressIPs {
+										if ipStr, ok := ipVal.(string); ok && ipStr == ip {
+											// Found the resource - check if it's overcommitted
+											if resName != "" && !overcommittedResources[resName] {
+												// Only flag if not overcommitted
+												mismatches = append(mismatches, EIPCPICMismatch{
+													IP:           ip,
+													EIPNode:      "",
+													CPICNode:     cpicNode,
+													EIPResource:  resName,
+													MismatchType: "missing_in_eip",
+												})
+											}
+											resourceFound = true
+											break
+										}
+									}
+									if resourceFound {
+										break
+									}
+								}
+							}
+						}
+					}
+				}
+
+				// Only flag as orphaned CPIC if we couldn't find it in any non-overcommitted resource
+				// This avoids false positives from overcommitted resources
+				if !resourceFound {
+					// Don't flag orphaned CPICs - they might be from overcommitted resources we can't identify
+					// Or they might be legitimate but in a transitional state
+				}
 			}
 		}
 	}
@@ -1224,7 +1280,13 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 		}
 
 		// Check IPs configured in EIP spec but not in EIP status.items
+		// Exclude overcommitted resources (missing IPs are expected when overcommitting)
 		for ip, resourceName := range eipResourceMap {
+			// Skip IPs from overcommitted resources
+			if resourceName != "" && overcommittedResources[resourceName] {
+				continue
+			}
+
 			_, existsInEIPStatus := eipIPToNode[ip]
 			if !existsInEIPStatus {
 				// IP is configured in EIP spec but not in EIP status.items
@@ -1318,14 +1380,64 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 						}
 					} else {
 						// IP is in CPIC but we can't determine which EIP resource it belongs to
-						// Still flag as mismatch (orphaned CPIC)
-						mismatches = append(mismatches, EIPCPICMismatch{
-							IP:           ip,
-							EIPNode:      "",
-							CPICNode:     cpicNode,
-							EIPResource:  "",
-							MismatchType: "missing_in_eip",
-						})
+						// Try to find it by checking all EIP resources' spec.egressIPs
+						// Don't flag orphaned CPICs - they might be from overcommitted resources we can't identify
+						resourceFound := false
+						if eipData != nil {
+							eipItems, ok := eipData["items"].([]interface{})
+							if ok {
+								for _, item := range eipItems {
+									itemMap, ok := item.(map[string]interface{})
+									if !ok {
+										continue
+									}
+
+									metadata, ok := itemMap["metadata"].(map[string]interface{})
+									var resName string
+									if ok {
+										name, _ := metadata["name"].(string)
+										namespace, _ := metadata["namespace"].(string)
+										if namespace != "" {
+											resName = fmt.Sprintf("%s/%s", namespace, name)
+										} else {
+											resName = name
+										}
+									}
+
+									// Skip if this resource is overcommitted
+									if resName != "" && overcommittedResources[resName] {
+										continue
+									}
+
+									spec, ok := itemMap["spec"].(map[string]interface{})
+									if ok {
+										if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+											for _, ipVal := range egressIPs {
+												if ipStr, ok := ipVal.(string); ok && ipStr == ip {
+													// Found the resource - check if it's overcommitted
+													if resName != "" && !overcommittedResources[resName] {
+														// Only flag if not overcommitted
+														mismatches = append(mismatches, EIPCPICMismatch{
+															IP:           ip,
+															EIPNode:      "",
+															CPICNode:     cpicNode,
+															EIPResource:  resName,
+															MismatchType: "missing_in_eip",
+														})
+													}
+													resourceFound = true
+													break
+												}
+											}
+											if resourceFound {
+												break
+											}
+										}
+									}
+								}
+							}
+						}
+						// Don't flag orphaned CPICs - they might be from overcommitted resources we can't identify
 					}
 				}
 			}
@@ -2089,14 +2201,18 @@ func (oc *OpenShiftClient) DetectCPICAzureDiscrepancy(nodeName string, eipData, 
 		IPToResource:   make(map[string]string),
 	}
 
-	// Build set of Azure NIC IPs for quick lookup
-	azureIPSet := make(map[string]bool)
-	for _, ip := range azureNICIPs {
-		azureIPSet[ip] = true
+	// Get available nodes count to identify overcommitted resources
+	availableNodes, err := oc.GetEIPEnabledNodes()
+	availableNodeCount := 0
+	if err == nil {
+		availableNodeCount = len(availableNodes)
 	}
 
-	// Build EIP resource map (IP -> resource name) from EIP data
+	// Build EIP resource map (IP -> resource name) from EIP data first
+	// This is needed to filter out non-EIP IPs from Azure NIC IPs
+	// Also identify overcommitted resources to exclude them from discrepancy reporting
 	eipResourceMap := make(map[string]string)
+	overcommittedResources := make(map[string]bool)
 	if eipData != nil {
 		eipItems, ok := eipData["items"].([]interface{})
 		if ok {
@@ -2120,15 +2236,33 @@ func (oc *OpenShiftClient) DetectCPICAzureDiscrepancy(nodeName string, eipData, 
 
 				spec, ok := itemMap["spec"].(map[string]interface{})
 				if ok {
+					configuredCount := 0
 					if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+						configuredCount = len(egressIPs)
 						for _, ipVal := range egressIPs {
 							if ipStr, ok := ipVal.(string); ok {
 								eipResourceMap[ipStr] = resourceName
 							}
 						}
 					}
+
+					// Mark resource as overcommitted if configured IPs > available nodes
+					if availableNodeCount > 0 && configuredCount > availableNodeCount {
+						overcommittedResources[resourceName] = true
+					}
 				}
 			}
+		}
+	}
+
+	// Build set of Azure NIC IPs for quick lookup
+	// Only include IPs that are configured as EIPs (exclude primary IP and other non-EIP IPs)
+	azureIPSet := make(map[string]bool)
+	for _, ip := range azureNICIPs {
+		// Only include IPs that are in the EIP resource map (i.e., configured as EIPs)
+		// This filters out the primary IP and any other non-EIP IPs
+		if _, isEIP := eipResourceMap[ip]; isEIP {
+			azureIPSet[ip] = true
 		}
 	}
 
@@ -2230,8 +2364,15 @@ func (oc *OpenShiftClient) DetectCPICAzureDiscrepancy(nodeName string, eipData, 
 	}
 
 	// Find IPs in CPIC but not on Azure NIC
+	// Exclude IPs from overcommitted resources (missing IPs are expected when overcommitting)
 	for cpicIP := range cpicIPSet {
 		if !azureIPSet[cpicIP] {
+			// Check if this IP belongs to an overcommitted resource
+			resourceName := eipResourceMap[cpicIP]
+			if resourceName != "" && overcommittedResources[resourceName] {
+				// Skip IPs from overcommitted resources - missing IPs are expected
+				continue
+			}
 			discrepancy.MissingInAzure = append(discrepancy.MissingInAzure, cpicIP)
 			// Ensure resource mapping is tracked
 			if resource, ok := eipResourceMap[cpicIP]; ok {
@@ -2241,8 +2382,15 @@ func (oc *OpenShiftClient) DetectCPICAzureDiscrepancy(nodeName string, eipData, 
 	}
 
 	// Find IPs on Azure NIC but not in CPIC Success
+	// Exclude IPs from overcommitted resources (missing IPs are expected when overcommitting)
 	for azureIP := range azureIPSet {
 		if !cpicIPSet[azureIP] {
+			// Check if this IP belongs to an overcommitted resource
+			resourceName := eipResourceMap[azureIP]
+			if resourceName != "" && overcommittedResources[resourceName] {
+				// Skip IPs from overcommitted resources - missing IPs are expected
+				continue
+			}
 			discrepancy.MissingInCPIC = append(discrepancy.MissingInCPIC, azureIP)
 		}
 	}
@@ -3121,7 +3269,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		// Check for EIP/CPIC mismatches only after 10 iterations without progress
 		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
-			detectedMismatches, err := em.ocClient.DetectEIPCPICMismatches()
+			// Use pre-fetched data for better performance and consistency
+			detectedMismatches, err := em.ocClient.DetectEIPCPICMismatchesWithData(eipData, cpicData)
 			if err != nil {
 				log.Printf("Warning: Failed to detect EIP/CPIC mismatches: %v", err)
 			} else {
