@@ -2501,13 +2501,15 @@ func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CP
 		}
 	}
 
-	// Continue monitoring if:
-	// 1. Assigned IPs don't match expected assignable (accounting for overcommitment), OR
-	// 2. CPIC success doesn't match expected assignable, OR
+	// Continue monitoring if ANY of these don't match expected outcome:
+	// 1. CPIC success doesn't match expected assignable, OR
+	// 2. EIP assigned doesn't match expected assignable, OR
 	// 3. Azure EIPs are not at 0 AND not equal to successful CPIC count
-	eipComplete := eipStats.Assigned == expectedAssignable && cpicStats.Success == expectedAssignable
+	// All three values must match before exiting monitoring
+	cpicComplete := cpicStats.Success == expectedAssignable
+	eipComplete := eipStats.Assigned == expectedAssignable
 	azureComplete := totalAzureEIPs == 0 || totalAzureEIPs == cpicStats.Success
-	return !eipComplete || !azureComplete
+	return !cpicComplete || !eipComplete || !azureComplete
 }
 
 type NodeStatus string
