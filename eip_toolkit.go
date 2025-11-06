@@ -1447,8 +1447,9 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 	return mismatches, nil
 }
 
-// CountOvercommittedEIPObjects counts EIP objects (resources) that have more IPs configured than available nodes
+// CountOvercommittedEIPObjects counts the total number of EIP IPs that are overcommitted
 // An EIP resource is overcommitted if configured IPs > number of nodes with egress-assignable label
+// Returns the total number of overcommitted IPs (configured IPs - available nodes) across all resources
 // If eipData is provided, it will be used instead of fetching again
 func (oc *OpenShiftClient) CountOvercommittedEIPObjects(eipData ...map[string]interface{}) (int, error) {
 	var data map[string]interface{}
@@ -1480,7 +1481,7 @@ func (oc *OpenShiftClient) CountOvercommittedEIPObjects(eipData ...map[string]in
 		return 0, nil
 	}
 
-	overcommittedCount := 0
+	totalOvercommittedIPs := 0
 	for _, item := range items {
 		itemMap, ok := item.(map[string]interface{})
 		if !ok {
@@ -1499,12 +1500,14 @@ func (oc *OpenShiftClient) CountOvercommittedEIPObjects(eipData ...map[string]in
 		}
 
 		// Resource is overcommitted if configured IPs > available nodes
+		// Count the number of overcommitted IPs for this resource
 		if configuredCount > availableNodeCount {
-			overcommittedCount++
+			overcommittedIPs := configuredCount - availableNodeCount
+			totalOvercommittedIPs += overcommittedIPs
 		}
 	}
 
-	return overcommittedCount, nil
+	return totalOvercommittedIPs, nil
 }
 
 // CountMalfunctioningEIPObjects counts EIP objects (resources) that have mismatches between their status.items and CPIC
