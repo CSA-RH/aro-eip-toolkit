@@ -3407,15 +3407,28 @@ type NodeCacheData struct {
 	LastUpdate time.Time
 }
 
-func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string, enablePerfMon bool, infiniteLoop bool) (*EIPMonitor, error) {
-	logsDir := filepath.Join(outputDir, "logs")
-	dataDir := filepath.Join(outputDir, "data")
-	plotsDir := filepath.Join(outputDir, "plots")
+func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string, enablePerfMon bool, infiniteLoop bool, screenMode bool) (*EIPMonitor, error) {
+	var logsDir, dataDir, plotsDir string
+	var bufferedLogger *BufferedLogger
 
-	for _, dir := range []string{logsDir, dataDir, plotsDir} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+	if screenMode {
+		// Screen mode: no directories or files created
+		logsDir = ""
+		dataDir = ""
+		plotsDir = ""
+		bufferedLogger = nil
+	} else {
+		logsDir = filepath.Join(outputDir, "logs")
+		dataDir = filepath.Join(outputDir, "data")
+		plotsDir = filepath.Join(outputDir, "plots")
+
+		for _, dir := range []string{logsDir, dataDir, plotsDir} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
+			}
 		}
+
+		bufferedLogger = NewBufferedLogger(logsDir, 100)
 	}
 
 	monitor := &EIPMonitor{
@@ -3425,7 +3438,7 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string, enablePerfMo
 		plotsDir:       plotsDir,
 		ocClient:       NewOpenShiftClient(),
 		azClient:       NewAzureClient(subscriptionID, resourceGroup),
-		bufferedLogger: NewBufferedLogger(logsDir, 100),
+		bufferedLogger: bufferedLogger,
 		nodeCache:      make(map[string]*NodeCacheData),
 		infiniteLoop:   infiniteLoop,
 	}
@@ -3561,29 +3574,55 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 		}
 	}
 
-	// Get node capacity and status (cached, as they rarely change)
+	// Get node capacity and status
+	// Capacity is cached longer (5 minutes) as it rarely changes
+	// Status is cached shorter (10 seconds) to reflect status changes quickly
 	capacity := 0
 	nodeStatus := NodeStatusUnknown
 
-	// Check cache first (5 minute TTL)
+	// Check cache first
 	em.nodeCacheMutex.RLock()
 	cached, exists := em.nodeCache[node]
-	cacheValid := exists && time.Since(cached.LastUpdate) < 5*time.Minute
+	capacityCacheValid := exists && time.Since(cached.LastUpdate) < 5*time.Minute
+	statusCacheValid := exists && time.Since(cached.LastUpdate) < 10*time.Second
 	em.nodeCacheMutex.RUnlock()
 
-	if cacheValid {
+	// Use cached capacity if valid
+	if capacityCacheValid {
 		capacity = cached.Capacity
+	}
+
+	// Use cached status if valid (shorter TTL for status)
+	if statusCacheValid {
 		nodeStatus = cached.Status
-	} else {
+	}
+
+	// Fetch fresh data if cache is invalid for either capacity or status
+	if !capacityCacheValid || !statusCacheValid {
 		// Fetch node data (combines capacity and status in one call)
 		nodeData, err := em.ocClient.GetNodeData(node)
 		if err != nil {
 			log.Printf("Error getting node data for %s: %v", node, err)
+			// Use cached values if available, even if expired
+			if exists {
+				if !capacityCacheValid {
+					capacity = cached.Capacity
+				}
+				if !statusCacheValid {
+					nodeStatus = cached.Status
+				}
+			}
 		} else {
-			capacity = nodeData.Capacity
-			nodeStatus = nodeData.Status
+			// Update capacity only if cache was invalid
+			if !capacityCacheValid {
+				capacity = nodeData.Capacity
+			}
+			// Always update status if cache was invalid (status changes frequently)
+			if !statusCacheValid {
+				nodeStatus = nodeData.Status
+			}
 
-			// Update cache
+			// Update cache with fresh data
 			em.nodeCacheMutex.Lock()
 			em.nodeCache[node] = &NodeCacheData{
 				Capacity:   capacity,
@@ -3594,27 +3633,29 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 		}
 	}
 
-	// Log node statistics
-	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_cpic", node), map[string]interface{}{
-		"success": nodeStats.CPICSuccess,
-		"pending": nodeStats.CPICPending,
-		"error":   nodeStats.CPICError,
-	})
+	// Log node statistics (skip if in screen mode)
+	if em.bufferedLogger != nil {
+		em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_cpic", node), map[string]interface{}{
+			"success": nodeStats.CPICSuccess,
+			"pending": nodeStats.CPICPending,
+			"error":   nodeStats.CPICError,
+		})
 
-	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_eip", node), map[string]interface{}{
-		"primary":   nodeStats.EIPAssigned,
-		"secondary": nodeStats.SecondaryEIPs,
-		"assigned":  nodeStats.EIPAssigned + nodeStats.SecondaryEIPs, // Total assigned (Primary + Secondary)
-	})
+		em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_ocp_eip", node), map[string]interface{}{
+			"primary":   nodeStats.EIPAssigned,
+			"secondary": nodeStats.SecondaryEIPs,
+			"assigned":  nodeStats.EIPAssigned + nodeStats.SecondaryEIPs, // Total assigned (Primary + Secondary)
+		})
 
-	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_azure", node), map[string]interface{}{
-		"eips": nodeStats.AzureEIPs,
-		"lbs":  nodeStats.AzureLBs,
-	})
+		em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_azure", node), map[string]interface{}{
+			"eips": nodeStats.AzureEIPs,
+			"lbs":  nodeStats.AzureLBs,
+		})
 
-	em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_capacity", node), map[string]interface{}{
-		"capacity": capacity,
-	})
+		em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_capacity", node), map[string]interface{}{
+			"capacity": capacity,
+		})
+	}
 
 	// Don't log here - will log after sorting in MonitorLoop
 
@@ -3694,18 +3735,21 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 		avgEIPs = avgEIPs / float64(nodeCount)
 	}
 
-	em.bufferedLogger.LogStats(timestamp, "cluster_summary", map[string]interface{}{
-		"total_primary_eips":   totalPrimaryEIPs,
-		"total_secondary_eips": totalSecondaryEIPs,
-		"total_assigned_eips":  totalAssignedEIPs,
-		"total_azure_eips":     totalAzureEIPs,
-		"total_azure_lbs":      totalAzureLBs,
-		"node_count":           nodeCount,
-		"avg_eips_per_node":    avgEIPs,
-	})
+	if em.bufferedLogger != nil {
+		em.bufferedLogger.LogStats(timestamp, "cluster_summary", map[string]interface{}{
+			"total_primary_eips":   totalPrimaryEIPs,
+			"total_secondary_eips": totalSecondaryEIPs,
+			"total_assigned_eips":  totalAssignedEIPs,
+			"total_azure_eips":     totalAzureEIPs,
+			"total_azure_lbs":      totalAzureLBs,
+			"node_count":           nodeCount,
+			"avg_eips_per_node":    avgEIPs,
+		})
+	}
 
-	// Write detailed summary
-	summaryFile := filepath.Join(em.logsDir, "cluster_eip_details.log")
+	// Write detailed summary (skip if in screen mode)
+	if em.logsDir != "" {
+		summaryFile := filepath.Join(em.logsDir, "cluster_eip_details.log")
 	f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return err
@@ -3721,10 +3765,11 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 		return sortedNodeData[i].Node < sortedNodeData[j].Node
 	})
 
-	for _, data := range sortedNodeData {
-		fmt.Fprintf(f, "%s %s %d %d %d %d\n", timestamp, data.Node, data.EIPAssigned, data.SecondaryEIPs, data.EIPAssigned+data.SecondaryEIPs, data.AzureEIPs)
+		for _, data := range sortedNodeData {
+			fmt.Fprintf(f, "%s %s %d %d %d %d\n", timestamp, data.Node, data.EIPAssigned, data.SecondaryEIPs, data.EIPAssigned+data.SecondaryEIPs, data.AzureEIPs)
+		}
+		fmt.Fprintf(f, "%s TOTAL %d %d %d %d\n\n", timestamp, totalPrimaryEIPs, totalSecondaryEIPs, totalAssignedEIPs, totalAzureEIPs)
 	}
-	fmt.Fprintf(f, "%s TOTAL %d %d %d %d\n\n", timestamp, totalPrimaryEIPs, totalSecondaryEIPs, totalAssignedEIPs, totalAzureEIPs)
 
 	return nil
 }
@@ -3962,9 +4007,14 @@ func (em *EIPMonitor) MonitorLoop() error {
 		fmt.Printf("%s%s\n", clearLine, timestampStr)
 		os.Stdout.Sync() // Flush immediately after timestamp
 
-		// Check progress status first (before node output, so we can use it for node coloring)
+		// Check for CPIC errors first - if errors exist, don't show "no progress" warnings
+		// This prevents showing both CPIC error and "no progress" messages simultaneously
+		hasCPICErrors := cpicStats.Error > 0
+
+		// Check progress status (before node output, so we can use it for node coloring)
+		// Only consider "no progress" if there are no CPIC errors
 		noProgressDetected := false
-		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
+		if !hasCPICErrors && progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
 			noProgressDetected = true
 		}
 
@@ -4026,10 +4076,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 			// Log status changes
 			if hasPrev && prev.Status != data.Status {
-				// Status changed - log the event
-				em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_status_event", data.Node), map[string]interface{}{
-					"event": fmt.Sprintf("status_change:%s:%s", prev.Status, data.Status),
-				})
+				// Status changed - log the event (skip if in screen mode)
+				if em.bufferedLogger != nil {
+					em.bufferedLogger.LogStats(timestamp, fmt.Sprintf("%s_status_event", data.Node), map[string]interface{}{
+						"event": fmt.Sprintf("status_change:%s:%s", prev.Status, data.Status),
+					})
+				}
 			}
 
 			// Store current values for next iteration
@@ -4102,15 +4154,17 @@ func (em *EIPMonitor) MonitorLoop() error {
 			log.Printf("Warning: Sum of Primary EIPs (%d) exceeds unique EIP resource count (%d). This may indicate double-counting or legitimate multi-node resource distribution.", totalPrimaryEIPs, eipResourceCount)
 		}
 
-		// Log EIP resource count (number of EIP objects) separately
-		em.bufferedLogger.LogStats(timestamp, "ocp_eips_configured", map[string]interface{}{
-			"value": eipResourceCount,
-		})
+		// Log EIP resource count (number of EIP objects) separately (skip if in screen mode)
+		if em.bufferedLogger != nil {
+			em.bufferedLogger.LogStats(timestamp, "ocp_eips_configured", map[string]interface{}{
+				"value": eipResourceCount,
+			})
 
-		// Log requested IPs (total number of IPs)
-		em.bufferedLogger.LogStats(timestamp, "ocp_eips_requested", map[string]interface{}{
-			"value": eipStats.Configured,
-		})
+			// Log requested IPs (total number of IPs)
+			em.bufferedLogger.LogStats(timestamp, "ocp_eips_requested", map[string]interface{}{
+				"value": eipStats.Configured,
+			})
+		}
 
 		// Format summary stats with highlighting
 		// Configured EIPs = number of EIP objects (resources)
@@ -4207,12 +4261,14 @@ func (em *EIPMonitor) MonitorLoop() error {
 					}
 				}
 
-				// Log mismatch statistics
-				em.bufferedLogger.LogStats(timestamp, "eip_cpic_mismatches", map[string]interface{}{
-					"total":          mismatchCount,
-					"node_mismatch":  nodeMismatches,
-					"missing_in_eip": missingInEIP,
-				})
+				// Log mismatch statistics (skip if in screen mode)
+				if em.bufferedLogger != nil {
+					em.bufferedLogger.LogStats(timestamp, "eip_cpic_mismatches", map[string]interface{}{
+						"total":          mismatchCount,
+						"node_mismatch":  nodeMismatches,
+						"missing_in_eip": missingInEIP,
+					})
+				}
 
 				if len(detectedMismatches) > 0 {
 					hasErrorMessage = true
@@ -4240,6 +4296,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 				clearLine, cpicStats.Error)
 			hasErrorMessage = true
 			// Reset progress tracker when errors are present (we don't want to show OVN-Kube message)
+			// Also clear any existing "no progress" warning by resetting warningShown
 			progressTracker.iterationsWithoutProgress = 0
 			progressTracker.baselineSet = false
 			progressTracker.warningShown = false
@@ -4304,7 +4361,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 					progressTracker.iterationsWithoutProgress++
 
 					// If 10 iterations without progress and no CPIC errors, show OVN-Kube warning (once per baseline)
-					if progressTracker.iterationsWithoutProgress >= 10 && !progressTracker.warningShown {
+					// Double-check for CPIC errors here to prevent showing warning when errors exist
+					if progressTracker.iterationsWithoutProgress >= 10 && !progressTracker.warningShown && cpicStats.Error == 0 {
 						// Print warning as part of the overwritable output block
 						fmt.Printf("%s\033[33;1m⚠️  No progress detected in 10 iterations. Please check OVN-Kube logs and restart pods in openshift-ovn-kubernetes namespace:\033[0m\n",
 							clearLine)
@@ -5861,6 +5919,7 @@ var (
 	outputDirVar           string
 	perfMonFlag            bool
 	infiniteLoopFlag       bool
+	screenFlag             bool
 	listMalfunctioningFlag bool
 	listCriticalFlag       bool
 	listPrimaryFlag        bool
@@ -6302,27 +6361,31 @@ func cmdMonitor() error {
 		}
 	}
 
-	// Create directories for monitoring output
-	timestamp := time.Now().Format("060102_150405")
+	// Create directories for monitoring output (skip if in screen mode)
 	var outputDir string
-	if outputDirVar != "" {
-		// Append timestamped directory to user-specified path
-		outputDir = filepath.Join(outputDirVar, timestamp)
-	} else {
-		// Create run directory in temp directory
-		tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
-		if err := os.MkdirAll(tempBase, 0755); err != nil {
-			return fmt.Errorf("failed to create temp base directory: %w", err)
+	if !screenFlag {
+		timestamp := time.Now().Format("060102_150405")
+		if outputDirVar != "" {
+			// Append timestamped directory to user-specified path
+			outputDir = filepath.Join(outputDirVar, timestamp)
+		} else {
+			// Create run directory in temp directory
+			tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
+			if err := os.MkdirAll(tempBase, 0755); err != nil {
+				return fmt.Errorf("failed to create temp base directory: %w", err)
+			}
+			outputDir = filepath.Join(tempBase, timestamp)
 		}
-		outputDir = filepath.Join(tempBase, timestamp)
 	}
 
-	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, infiniteLoopFlag)
+	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, infiniteLoopFlag, screenFlag)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Output directory: %s", outputDir)
+	if !screenFlag {
+		log.Printf("Output directory: %s", outputDir)
+	}
 	return monitor.MonitorLoop()
 }
 
@@ -6398,25 +6461,29 @@ func cmdAll() error {
 
 		if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs) {
 			// Monitoring not needed, but still create monitor and run one iteration to show performance stats
-			// Create directories for monitoring output (even though we'll only do one iteration)
-			timestamp := time.Now().Format("060102_150405")
+			// Create directories for monitoring output (even though we'll only do one iteration) - skip if in screen mode
 			var outputDir string
-			if outputDirVar != "" {
-				outputDir = filepath.Join(outputDirVar, timestamp)
-			} else {
-				tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
-				if err := os.MkdirAll(tempBase, 0755); err != nil {
-					return fmt.Errorf("failed to create temp base directory: %w", err)
+			if !screenFlag {
+				timestamp := time.Now().Format("060102_150405")
+				if outputDirVar != "" {
+					outputDir = filepath.Join(outputDirVar, timestamp)
+				} else {
+					tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
+					if err := os.MkdirAll(tempBase, 0755); err != nil {
+						return fmt.Errorf("failed to create temp base directory: %w", err)
+					}
+					outputDir = filepath.Join(tempBase, timestamp)
 				}
-				outputDir = filepath.Join(tempBase, timestamp)
 			}
 
-			monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, false)
+			monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, false, screenFlag)
 			if err != nil {
 				return err
 			}
 
-			log.Printf("Output directory: %s", outputDir)
+			if !screenFlag {
+				log.Printf("Output directory: %s", outputDir)
+			}
 			// Print current state
 			if err := PrintCurrentState(); err != nil {
 				return err
@@ -6430,31 +6497,41 @@ func cmdAll() error {
 		}
 	}
 
-	// Create directories for monitoring output
-	timestamp := time.Now().Format("060102_150405")
+	// Create directories for monitoring output (skip if in screen mode)
 	var outputDir string
-	if outputDirVar != "" {
-		// Append timestamped directory to user-specified path
-		outputDir = filepath.Join(outputDirVar, timestamp)
-	} else {
-		// Create run directory in temp directory
-		tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
-		if err := os.MkdirAll(tempBase, 0755); err != nil {
-			return fmt.Errorf("failed to create temp base directory: %w", err)
+	if !screenFlag {
+		timestamp := time.Now().Format("060102_150405")
+		if outputDirVar != "" {
+			// Append timestamped directory to user-specified path
+			outputDir = filepath.Join(outputDirVar, timestamp)
+		} else {
+			// Create run directory in temp directory
+			tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
+			if err := os.MkdirAll(tempBase, 0755); err != nil {
+				return fmt.Errorf("failed to create temp base directory: %w", err)
+			}
+			outputDir = filepath.Join(tempBase, timestamp)
 		}
-		outputDir = filepath.Join(tempBase, timestamp)
 	}
 
-	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, false)
+	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, false, screenFlag)
 	if err != nil {
 		return err
 	}
 
-	log.Printf("Output directory: %s", outputDir)
+	if !screenFlag {
+		log.Printf("Output directory: %s", outputDir)
+	}
 	if err := monitor.MonitorLoop(); err != nil {
 		return err
 	}
 	log.Println("✅ Phase 1 Complete: Monitoring finished")
+
+	// Skip merge and plot phases if in screen mode (no files created)
+	if screenFlag {
+		log.Println("Screen mode enabled - skipping merge and plot phases")
+		return nil
+	}
 
 	// Phase 2: Merge
 	log.Println("🔄 Phase 2: Starting Log Merge...")
@@ -6497,6 +6574,7 @@ func main() {
 	monitorCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 	monitorCmd.Flags().BoolVar(&perfMonFlag, "perfmon", false, "Enable performance monitoring")
 	monitorCmd.Flags().BoolVar(&infiniteLoopFlag, "infinite", false, "Run monitoring loop indefinitely (don't exit when monitoring is complete)")
+	monitorCmd.Flags().BoolVar(&screenFlag, "screen", false, "Screen-only mode: prevent any directories or files from being created")
 	monitorCmd.Flags().BoolVar(&listMalfunctioningFlag, "list-malfunctioning", false, "List malfunctioning EIP resources and exit")
 	monitorCmd.Flags().BoolVar(&listCriticalFlag, "list-critical", false, "List critical EIP resources and exit")
 	monitorCmd.Flags().BoolVar(&listPrimaryFlag, "list-primary", false, "List primary EIP assignments and exit")
