@@ -1,0 +1,230 @@
+name: Nightly Build and Release
+
+on:
+  schedule:
+    # Run nightly at 2 AM UTC (adjust timezone as needed)
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggering
+  push:
+    tags:
+      - 'v*' # Also build on version tags
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+            goos: linux
+            goarch: amd64
+            binary_name: eip-toolkit-linux-amd64
+          - os: ubuntu-latest
+            arch: arm64
+            goos: linux
+            goarch: arm64
+            binary_name: eip-toolkit-linux-arm64
+          - os: macos-latest
+            arch: amd64
+            goos: darwin
+            goarch: amd64
+            binary_name: eip-toolkit-darwin-amd64
+          - os: macos-latest
+            arch: arm64
+            goos: darwin
+            goarch: arm64
+            binary_name: eip-toolkit-darwin-arm64
+          - os: windows-latest
+            arch: amd64
+            goos: windows
+            goarch: amd64
+            binary_name: eip-toolkit-windows-amd64.exe
+          - os: windows-latest
+            arch: arm64
+            goos: windows
+            goarch: arm64
+            binary_name: eip-toolkit-windows-arm64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -o ${{ matrix.binary_name }} eip_toolkit.go
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            # Windows binaries already have .exe extension
+            echo "Binary built: ${{ matrix.binary_name }}"
+          else
+            chmod +x ${{ matrix.binary_name }}
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary_name }}
+          path: ${{ matrix.binary_name }}
+          retention-days: 7
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only create release on schedule or manual dispatch, not on tag pushes
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Generate version tag
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            # Use date-based versioning for nightly builds
+            DATE=$(date +%Y%m%d)
+            VERSION="nightly-${DATE}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+            echo "name=Nightly Build ${DATE}" >> $GITHUB_OUTPUT
+          else
+            # Manual dispatch - use timestamp
+            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+            VERSION="nightly-${TIMESTAMP}"
+            echo "version=${VERSION}" >> $GITHUB_OUTPUT
+            echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+            echo "name=Nightly Build ${TIMESTAMP}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.name }}
+          body: |
+            ## Nightly Build
+
+            This is an automated nightly build of the EIP Toolkit.
+
+            **Build Date:** ${{ github.event.schedule || github.run_started_at }}
+            **Commit:** ${{ github.sha }}
+            **Branch:** ${{ github.ref_name }}
+
+            ### Binaries
+
+            - `eip-toolkit-linux-amd64` - Linux x86_64
+            - `eip-toolkit-linux-arm64` - Linux ARM64
+            - `eip-toolkit-darwin-amd64` - macOS Intel
+            - `eip-toolkit-darwin-arm64` - macOS Apple Silicon
+            - `eip-toolkit-windows-amd64.exe` - Windows x86_64
+            - `eip-toolkit-windows-arm64.exe` - Windows ARM64
+
+            ### Installation
+
+            Download the binary for your platform and make it executable
+            (Linux/macOS):
+            ```bash
+            chmod +x eip-toolkit-<platform>
+            ```
+
+            For Windows, the `.exe` file is ready to use.
+          files: |
+            artifacts/eip-toolkit-*
+          draft: false
+          prerelease: true
+
+  release-on-tag:
+    name: Create Release on Tag
+    needs: build
+    runs-on: ubuntu-latest
+    # Only create release on tag pushes
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Get tag name
+        id: tag
+        run: |
+          TAG=${GITHUB_REF#refs/tags/}
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "name=Release ${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            CHANGELOG="Full changelog available in the repository."
+          else
+            CHANGELOG=$(git log ${PREV_TAG}..HEAD \
+              --pretty=format:"- %s (%h)" || \
+              echo "Full changelog available in the repository.")
+          fi
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.name }}
+          body: |
+            ## Release ${{ steps.tag.outputs.tag }}
+
+            ### Changes
+
+            ${{ steps.changelog.outputs.changelog }}
+
+            ### Binaries
+
+            - `eip-toolkit-linux-amd64` - Linux x86_64
+            - `eip-toolkit-linux-arm64` - Linux ARM64
+            - `eip-toolkit-darwin-amd64` - macOS Intel
+            - `eip-toolkit-darwin-arm64` - macOS Apple Silicon
+            - `eip-toolkit-windows-amd64.exe` - Windows x86_64
+            - `eip-toolkit-windows-arm64.exe` - Windows ARM64
+
+            ### Installation
+
+            Download the binary for your platform and make it executable
+            (Linux/macOS):
+            ```bash
+            chmod +x eip-toolkit-<platform>
+            ```
+
+            For Windows, the `.exe` file is ready to use.
+          files: |
+            artifacts/eip-toolkit-*
+          draft: false
+          prerelease: false
+
