@@ -17,13 +17,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-latest  # GitHub Actions runner (must be ubuntu-latest)
             display_os: linux
             arch: amd64
             goos: linux
             goarch: amd64
             binary_name: eip-toolkit-linux-amd64
-          - os: ubuntu-latest
+          - os: ubuntu-latest  # GitHub Actions runner (must be ubuntu-latest)
             display_os: linux
             arch: arm64
             goos: linux
@@ -85,7 +85,7 @@ jobs:
   release:
     name: Create Release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # Linux runner
     # Only create release on schedule or manual dispatch, not on tag pushes
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     permissions:
@@ -159,7 +159,7 @@ jobs:
   release-on-tag:
     name: Create Release on Tag
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest  # Linux runner
     # Only create release on tag pushes
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
