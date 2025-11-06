@@ -61,6 +61,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+        shell: bash
         run: |
           go build -o ${{ matrix.binary_name }} eip_toolkit.go
           if [ "${{ matrix.goos }}" = "windows" ]; then
