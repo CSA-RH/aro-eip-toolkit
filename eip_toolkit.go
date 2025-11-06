@@ -3959,32 +3959,34 @@ func (em *EIPMonitor) MonitorLoop() error {
 			eipResourceCount = len(items)
 		}
 
-		// Log global statistics
+		// Log global statistics (skip if in screen mode)
 		// Note: "configured" = number of EIP objects, "requested" = total number of IPs
-		em.bufferedLogger.LogStats(timestamp, "ocp_eips", map[string]interface{}{
-			"configured": eipResourceCount,    // Number of EIP objects (resources)
-			"requested":  eipStats.Configured, // Total number of requested IPs
-			"assigned":   eipStats.Assigned,
-			"unassigned": eipStats.Unassigned,
-		})
+		if em.bufferedLogger != nil {
+			em.bufferedLogger.LogStats(timestamp, "ocp_eips", map[string]interface{}{
+				"configured": eipResourceCount,    // Number of EIP objects (resources)
+				"requested":  eipStats.Configured, // Total number of requested IPs
+				"assigned":   eipStats.Assigned,
+				"unassigned": eipStats.Unassigned,
+			})
 
-		em.bufferedLogger.LogStats(timestamp, "ocp_cpic", map[string]interface{}{
-			"success": cpicStats.Success,
-			"pending": cpicStats.Pending,
-			"error":   cpicStats.Error,
-		})
+			em.bufferedLogger.LogStats(timestamp, "ocp_cpic", map[string]interface{}{
+				"success": cpicStats.Success,
+				"pending": cpicStats.Pending,
+				"error":   cpicStats.Error,
+			})
 
-		em.bufferedLogger.LogStats(timestamp, "malfunctioning_eip_objects", map[string]interface{}{
-			"count": malfunctioningEIPs,
-		})
+			em.bufferedLogger.LogStats(timestamp, "malfunctioning_eip_objects", map[string]interface{}{
+				"count": malfunctioningEIPs,
+			})
 
-		em.bufferedLogger.LogStats(timestamp, "overcommitted_eip_objects", map[string]interface{}{
-			"count": overcommittedEIPs,
-		})
+			em.bufferedLogger.LogStats(timestamp, "overcommitted_eip_objects", map[string]interface{}{
+				"count": overcommittedEIPs,
+			})
 
-		em.bufferedLogger.LogStats(timestamp, "critical_eip_objects", map[string]interface{}{
-			"count": criticalEIPs,
-		})
+			em.bufferedLogger.LogStats(timestamp, "critical_eip_objects", map[string]interface{}{
+				"count": criticalEIPs,
+			})
+		}
 
 		// Collect node data in parallel (using pre-fetched EIP and CPIC data for better performance)
 		nodeData := em.CollectNodeDataParallel(nodes, timestamp, eipData, cpicData)
@@ -4360,10 +4362,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 					// No progress, increment counter
 					progressTracker.iterationsWithoutProgress++
 
-					// If 10 iterations without progress and no CPIC errors, show OVN-Kube warning (once per baseline)
+					// If 10 iterations without progress and no CPIC errors, show OVN-Kube warning
+					// Re-print warning every iteration while it should be shown (to maintain formatting)
 					// Double-check for CPIC errors here to prevent showing warning when errors exist
-					if progressTracker.iterationsWithoutProgress >= 10 && !progressTracker.warningShown && cpicStats.Error == 0 {
+					if progressTracker.iterationsWithoutProgress >= 10 && cpicStats.Error == 0 {
 						// Print warning as part of the overwritable output block
+						// Use clearLine to overwrite any existing warning text
 						fmt.Printf("%s\033[33;1m⚠️  No progress detected in 10 iterations. Please check OVN-Kube logs and restart pods in openshift-ovn-kubernetes namespace:\033[0m\n",
 							clearLine)
 						fmt.Printf("%s   stern -n openshift-ovn-kubernetes ovnkube-control-plane.\n", clearLine)
@@ -4371,7 +4375,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 						fmt.Printf("%s   oc delete pods -n openshift-ovn-kubernetes -l app=ovnkube-control-plane\n", clearLine)
 						fmt.Printf("%s   oc delete pods -n openshift-ovn-kubernetes -l app=ovnkube-node\n", clearLine)
 						hasErrorMessage = true
-						progressTracker.warningShown = true
+						if !progressTracker.warningShown {
+							progressTracker.warningShown = true
+						}
 					}
 				}
 			}
@@ -4399,7 +4405,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Unassigned EIPs output is no longer displayed
 			if cpicStats.Error > 0 {
 				linesPrinted += 1 // CPIC error message (1 line)
-			} else if progressTracker.iterationsWithoutProgress >= 10 && progressTracker.warningShown {
+			} else if !hasCPICErrors && progressTracker.iterationsWithoutProgress >= 10 && progressTracker.warningShown {
+				// Count warning lines if warning is currently being shown
+				// The warning persists on screen until progress is detected
 				linesPrinted += 5 // OVN-Kube warning (5 lines: header + 4 commands)
 			}
 		}
@@ -4439,8 +4447,11 @@ func (em *EIPMonitor) MonitorLoop() error {
 		}
 
 		// Flush all buffered logs (errors go to stderr, won't affect stdout)
-		if err := em.bufferedLogger.FlushAll(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error flushing logs: %v\n", err)
+		// Skip if in screen mode (no bufferedLogger)
+		if em.bufferedLogger != nil {
+			if err := em.bufferedLogger.FlushAll(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error flushing logs: %v\n", err)
+			}
 		}
 
 		// Calculate total Azure resources across all nodes
