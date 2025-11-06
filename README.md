@@ -182,12 +182,17 @@ User
          │   └─> Count EIP resources with configured IPs > available nodes
          │
          ├─> CollectNodeDataParallel() (goroutines)
-         │   ├─> OpenShiftClient.GetNodeStats()
+         │   ├─> OpenShiftClient.GetNodeStatsFromData()
          │   │   ├─> Calculate Primary EIPs (first IP from each EIP resource)
          │   │   └─> Calculate Secondary EIPs (CPIC Success - Primary)
          │   ├─> AzureClient.GetNodeNICStats()
          │   │   └─> az network nic show
          │   │       └─> Parse JSON → (ips, lbs)
+         │   ├─> AzureClient.GetNodeNICIPs()
+         │   │   └─> az network nic show
+         │   │       └─> Get actual IP addresses list
+         │   ├─> DetectCPICAzureDiscrepancy()
+         │   │   └─> Compare CPIC Success IPs vs Azure NIC IPs
          │   └─> BufferedLogger.LogStats()
          │       ├─> Log primary/secondary/assigned EIPs per node
          │       ├─> Log malfunctioning EIP count
@@ -195,6 +200,7 @@ User
          │
          ├─> (After 10 iterations without progress)
          │   ├─> DetectEIPCPICMismatches() (if not already done)
+         │   ├─> Display CPIC/Azure discrepancies (per-node)
          │   └─> DetectUnassignedEIPs() (if no mismatches detected)
          │
          └─> Write to log files (logs/*.log)
@@ -237,21 +243,34 @@ User
 
 The monitoring command displays:
 - Timestamp at the top of each iteration
-- Per-node statistics: CPIC (success/pending/error), Primary EIPs, Secondary EIPs, Azure NIC stats
-- Cluster summary: Configured EIPs, Successful CPICs, Assigned EIPs, Malfunction EIPs, Overcommitted EIPs, CNCC status
+- Per-node statistics: CPIC (success/pending/error), Assigned EIP (primary/secondary), Azure NIC stats
+- Cluster summary: Configured EIPs, Successful CPICs, Assigned EIP (primary/secondary), Malfunction EIPs, Overcommitted EIPs, CNCC status
 - Changed values highlighted in yellow/bold
 - Output overwrites previous lines using ANSI escape codes (terminal only)
 - After 10 iterations without progress:
   - EIP/CPIC mismatches
+  - CPIC/Azure discrepancies (when CPIC Success, Total Assigned EIPs, and Azure IPs don't match)
   - Unassigned EIPs
   - CPIC errors
 
 Example output:
 ```
 2025/11/04 17:55:22
-aro-worker-node1 - CPIC: 32/0/0, Primary EIPs: 30, Secondary EIPs: 2, Azure: 32/32, Capacity: 223/255
-aro-worker-node2 - CPIC: 33/0/0, Primary EIPs: 31, Secondary EIPs: 2, Azure: 33/33, Capacity: 222/255
-Cluster Summary: Configured EIPs: 100, Successful CPICs: 100, Assigned EIPs: 100, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 342/512
+aro-worker-node1 - CPIC: 32/0/0, Assigned EIP: 30/2, Azure: 32/0, Capacity: 223/255
+aro-worker-node2 - CPIC: 33/0/0, Assigned EIP: 31/2, Azure: 33/0, Capacity: 222/255
+Cluster Summary: Configured EIPs: 100, Requested EIPs: 100, Successful CPICs: 100, Assigned EIP: 61/4, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 342/512
+```
+
+Example with CPIC/Azure discrepancy:
+```
+2025/11/04 17:55:22
+aro-worker-node1 - CPIC: 120/0/0, Assigned EIP: 79/41, Azure: 85/0, Capacity: 135/255
+⚠️  CPIC/Azure Discrepancy: CPIC Success (120) > Azure IPs (85), 35 IPs missing in Azure
+   Missing in Azure (10 shown of 35):
+   - 10.0.2.45 (namespace1/eip-resource-1)
+   - 10.0.2.46 (namespace1/eip-resource-1)
+   - 10.0.2.47 (namespace2/eip-resource-2)
+   ...
 ```
 
 Note: Capacity values show available/total (e.g., "223/255" means 223 available out of 255 total capacity).
@@ -259,9 +278,15 @@ Note: Capacity values show available/total (e.g., "223/255" means 223 available 
 **Metrics:**
 - **Primary EIPs**: First IP in `status.items` of each EIP resource assigned to the node. Each EIP resource contributes at most one Primary EIP.
 - **Secondary EIPs**: Additional IPs from the same EIP resource. Calculated as `CPIC Success - Primary EIPs`.
-- **Assigned EIPs**: Total assigned IPs (Primary + Secondary). Should match CPIC Success count.
+- **Assigned EIP**: Displayed as "x/y" where x is Primary EIPs and y is Secondary EIPs. Total (x+y) should match CPIC Success count.
+- **Azure IPs**: Actual secondary IPs configured on the Azure NIC. Should match CPIC Success and Total Assigned EIPs.
 - **Malfunction EIPs**: EIP resources where `status.items` don't match CPIC assignments. Red if > 0.
 - **Overcommitted EIPs**: EIP resources with more IPs configured than available nodes. Yellow if > 0.
+
+**Expected Relationships:**
+- CPIC Success = Total Assigned EIPs (Primary + Secondary) = Azure IPs
+- When these values don't match, a discrepancy is detected and reported
+- Azure IPs are the source of truth - if CPIC Success > Azure IPs, some IPs are reported as successful in CPIC but not actually on the Azure NIC
 
 ### Monitoring Logic
 
@@ -284,6 +309,18 @@ Where `expectedAssignable = Configured - unassignableIPs` (accounting for overco
 - Detected after 10 iterations without progress
 - Overcommitted EIP resources excluded to avoid false positives
 - Detailed IP lists shown after 10 iterations, hidden when progress detected
+
+**CPIC/Azure Discrepancy Detection:**
+- Detects when CPIC Success, Total Assigned EIPs, and Azure IPs don't match
+- Azure is the source of truth - discrepancies indicate CPIC reporting IPs that aren't actually on the Azure NIC
+- Detected per-node and displayed when:
+  - Discrepancy detected (values don't match)
+  - AND no progress detected for 10 iterations (same condition as yellow highlighting)
+- Shows detailed information:
+  - Which IPs are in CPIC Success but not on Azure NIC (with EIP resource names if available)
+  - Which IPs are on Azure NIC but not in CPIC Success
+  - Discrepancy count and message
+- Node output highlighted in yellow when discrepancy detected and no progress for 10 iterations
 
 **Unassigned EIP Detection:**
 - Detected after 10 iterations without progress
@@ -328,8 +365,10 @@ All logged metrics are automatically plotted. The following metrics are logged t
 - Terminal detection for formatting adjustments
 - Progress tracking for conditional warning display
 - Mismatch detection between EIP and CPIC node assignments
+- CPIC/Azure discrepancy detection to identify IPs reported in CPIC but not on Azure NIC
 - Overcommitment detection for EIP resources with more IPs than available nodes
 - Early exit with state display when no monitoring needed
+- Optimized API calls: EIP and CPIC data fetched once per iteration and reused for all nodes
 - Cross-platform support (Linux x86_64/ARM64, macOS Intel/Apple Silicon)
 
 ### Platform Support
