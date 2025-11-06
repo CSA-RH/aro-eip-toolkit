@@ -3443,6 +3443,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 			clearLine = "\033[K"
 		}
 		fmt.Printf("%s%s\n", clearLine, timestampStr)
+		os.Stdout.Sync() // Flush immediately after timestamp
 
 		// Check progress status first (before node output, so we can use it for node coloring)
 		noProgressDetected := false
@@ -3520,6 +3521,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 			*prevValues[data.Node] = *data
 		}
+		os.Stdout.Sync() // Flush after node output
 
 		// Calculate total cluster capacity from subnet CIDR (cached, as it rarely changes)
 		var clusterCapacity int
@@ -3662,6 +3664,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
 			clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+		os.Stdout.Sync() // Flush immediately after summary
 
 		// Track if we need to display error/warning messages
 		hasErrorMessage := false
