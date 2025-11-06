@@ -3265,7 +3265,6 @@ func (em *EIPMonitor) MonitorLoop() error {
 		hasErrorMessage := false
 		var mismatchCount int
 		var mismatches []EIPCPICMismatch // Store mismatches for detailed display later
-		var unassignedCount int
 
 		// Check for EIP/CPIC mismatches only after 10 iterations without progress
 		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
@@ -3320,35 +3319,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// Note: eipStats.Configured represents requested IPs (total number of IPs requested)
 		actualUnassigned := eipStats.Configured - totalAssignedEIPs
 		if actualUnassigned > 0 && progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 && mismatchCount == 0 {
-			unassignedEIPs, err := em.ocClient.DetectUnassignedEIPs()
+			// Detection still happens for logging purposes, but output is not displayed
+			_, err := em.ocClient.DetectUnassignedEIPs()
 			if err != nil {
 				log.Printf("Warning: Failed to detect unassigned EIPs: %v", err)
-			} else {
-				// Limit to the actual unassigned count (Configured - Assigned)
-				// Use totalAssignedEIPs (which matches CPIC Success) as source of truth
-				displayUnassigned := unassignedEIPs
-				if len(unassignedEIPs) > actualUnassigned {
-					// Only show the first N unassigned IPs where N = actualUnassigned
-					displayUnassigned = unassignedEIPs[:actualUnassigned]
-				}
-
-				if len(displayUnassigned) > 0 {
-					unassignedCount = len(displayUnassigned)
-					// Build display with IP addresses and reasons
-					var parts []string
-					for _, unassigned := range displayUnassigned {
-						if unassigned.Resource != "" {
-							parts = append(parts, fmt.Sprintf("%s (%s: %s)", unassigned.IP, unassigned.Resource, unassigned.Reason))
-						} else {
-							parts = append(parts, fmt.Sprintf("%s (%s)", unassigned.IP, unassigned.Reason))
-						}
-					}
-
-					// Use actualUnassigned (Requested - totalAssignedEIPs) as the count
-					fmt.Printf("%s\033[33;1m⚠️  Unassigned EIPs: %d IP(s) - %s\033[0m\n",
-						clearLine, actualUnassigned, strings.Join(parts, ", "))
-					hasErrorMessage = true
-				}
 			}
 		}
 
@@ -3456,9 +3430,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 			if mismatchCount > 0 {
 				linesPrinted += 1 // EIP/CPIC mismatch summary (1 line)
 			}
-			if unassignedCount > 0 {
-				linesPrinted += 1 // Unassigned EIPs warning (1 line)
-			}
+			// Unassigned EIPs output is no longer displayed
 			if cpicStats.Error > 0 {
 				linesPrinted += 1 // CPIC error message (1 line)
 			} else if progressTracker.iterationsWithoutProgress >= 10 && progressTracker.warningShown {
