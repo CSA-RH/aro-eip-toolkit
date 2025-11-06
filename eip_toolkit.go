@@ -1771,6 +1771,523 @@ func (oc *OpenShiftClient) CountCriticalEIPObjects(eipData, cpicData map[string]
 	return len(criticalResources), nil
 }
 
+// MalfunctioningEIPInfo contains information about a malfunctioning EIP resource
+type MalfunctioningEIPInfo struct {
+	Resource   string            // EIP resource name/namespace
+	Mismatches []EIPCPICMismatch // List of mismatches for this resource
+}
+
+// CriticalEIPInfo contains information about a critical EIP resource
+type CriticalEIPInfo struct {
+	Resource    string   // EIP resource name/namespace
+	Reason      string   // Why it's critical: "no_assignments" or "all_mismatches"
+	StatusIPs   []string // IPs in status.items (if any)
+	MismatchIPs []string // IPs with mismatches
+}
+
+// PrimaryEIPInfo contains information about a primary EIP assignment
+type PrimaryEIPInfo struct {
+	Resource string // EIP resource name/namespace
+	IP       string // IP address
+	Node     string // Node name
+}
+
+// SecondaryEIPInfo contains information about a secondary EIP assignment
+type SecondaryEIPInfo struct {
+	Resource string // EIP resource name/namespace
+	IP       string // IP address
+	Node     string // Node name
+	Index    int    // Index in status.items (1-based, where 0 is primary)
+}
+
+// ListMalfunctioningEIPs returns a list of malfunctioning EIP resources with their mismatches
+func (oc *OpenShiftClient) ListMalfunctioningEIPs(eipData, cpicData map[string]interface{}) ([]MalfunctioningEIPInfo, error) {
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group mismatches by resource
+	resourceMismatches := make(map[string][]EIPCPICMismatch)
+	for _, m := range mismatches {
+		if m.EIPResource != "" {
+			resourceMismatches[m.EIPResource] = append(resourceMismatches[m.EIPResource], m)
+		}
+	}
+
+	// Convert to list
+	var result []MalfunctioningEIPInfo
+	for resource, mismatches := range resourceMismatches {
+		result = append(result, MalfunctioningEIPInfo{
+			Resource:   resource,
+			Mismatches: mismatches,
+		})
+	}
+
+	// Sort by resource name
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Resource < result[j].Resource
+	})
+
+	return result, nil
+}
+
+// ListCriticalEIPs returns a list of critical EIP resources
+func (oc *OpenShiftClient) ListCriticalEIPs(eipData, cpicData map[string]interface{}) ([]CriticalEIPInfo, error) {
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	if err != nil {
+		return nil, err
+	}
+
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return []CriticalEIPInfo{}, nil
+	}
+
+	// Build map of IPs with mismatches by resource
+	resourceMismatchIPs := make(map[string]map[string]bool) // resource -> set of IPs with mismatches
+	for _, m := range mismatches {
+		if m.EIPResource != "" && m.IP != "" {
+			if resourceMismatchIPs[m.EIPResource] == nil {
+				resourceMismatchIPs[m.EIPResource] = make(map[string]bool)
+			}
+			resourceMismatchIPs[m.EIPResource][m.IP] = true
+		}
+	}
+
+	// Get CPIC IP->node mapping for verification
+	cpicIPToNode, err := oc.getIPToNodeMappingFromData(cpicData)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get CPIC IP to node mapping: %w", err)
+	}
+
+	// Build EIP IP->node mapping from status.items
+	eipIPToNode := make(map[string]string)
+	eipIPToResource := make(map[string]string)
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get EIP resource name/namespace
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		// Get IPs from status.items (those with node assignments)
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		spec, _ := itemMap["spec"].(map[string]interface{})
+		var configuredIPs []string
+		if spec != nil {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ipVal := range egressIPs {
+					if ipStr, ok := ipVal.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+		}
+
+		if statusItems, ok := status["items"].([]interface{}); ok {
+			for i, statusItem := range statusItems {
+				statusItemMap, ok := statusItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// Check if this item has a node assignment
+				nodeValue, hasNode := statusItemMap["node"]
+				if !hasNode || nodeValue == nil {
+					continue
+				}
+
+				var nodeStr string
+				switch v := nodeValue.(type) {
+				case string:
+					nodeStr = v
+				default:
+					nodeStr = fmt.Sprintf("%v", v)
+				}
+
+				if nodeStr == "" {
+					continue
+				}
+
+				// Get IP from status item
+				var ip string
+				if egressIPValue, hasIP := statusItemMap["egressIP"]; hasIP {
+					switch v := egressIPValue.(type) {
+					case string:
+						ip = v
+					default:
+						ip = fmt.Sprintf("%v", v)
+					}
+				} else if i < len(configuredIPs) {
+					// Fall back to positional mapping
+					ip = configuredIPs[i]
+				}
+
+				if ip != "" {
+					eipIPToNode[ip] = nodeStr
+					eipIPToResource[ip] = resourceName
+				}
+			}
+		}
+	}
+
+	// Build map of resources -> IPs in status.items
+	resourceStatusIPs := make(map[string]map[string]bool) // resource -> set of IPs in status.items
+	for ip, resourceName := range eipIPToResource {
+		if resourceName != "" {
+			if resourceStatusIPs[resourceName] == nil {
+				resourceStatusIPs[resourceName] = make(map[string]bool)
+			}
+			resourceStatusIPs[resourceName][ip] = true
+		}
+	}
+
+	// Identify critical EIPs
+	var result []CriticalEIPInfo
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		statusIPs := resourceStatusIPs[resourceName]
+		mismatchIPs := resourceMismatchIPs[resourceName]
+
+		// If no IPs in status.items at all, it's critical
+		if len(statusIPs) == 0 {
+			statusIPsList := []string{}
+			mismatchIPsList := []string{}
+			for ip := range mismatchIPs {
+				mismatchIPsList = append(mismatchIPsList, ip)
+			}
+			sort.Strings(mismatchIPsList)
+			result = append(result, CriticalEIPInfo{
+				Resource:    resourceName,
+				Reason:      "no_assignments",
+				StatusIPs:   statusIPsList,
+				MismatchIPs: mismatchIPsList,
+			})
+			continue
+		}
+
+		// Check if ALL IPs in status.items have mismatches
+		allIPsHaveMismatches := true
+		for ip := range statusIPs {
+			// Check if this IP is in the mismatch list
+			if mismatchIPs != nil && mismatchIPs[ip] {
+				continue // This IP has a mismatch
+			}
+
+			// If not in mismatch list, verify it actually matches CPIC
+			eipNode := eipIPToNode[ip]
+			cpicNode, existsInCPIC := cpicIPToNode[ip]
+
+			if existsInCPIC && eipNode != cpicNode {
+				// Node mismatch - this IP is misaligned
+				continue
+			} else if !existsInCPIC {
+				// IP not in CPIC - could be misaligned, but be conservative
+				// Don't count as working
+				continue
+			} else if eipNode == cpicNode {
+				// IP matches CPIC - this is a working assignment
+				allIPsHaveMismatches = false
+				break
+			}
+		}
+
+		// If all IPs in status.items have mismatches, it's critical
+		if allIPsHaveMismatches && len(statusIPs) > 0 {
+			statusIPsList := []string{}
+			mismatchIPsList := []string{}
+			for ip := range statusIPs {
+				statusIPsList = append(statusIPsList, ip)
+			}
+			for ip := range mismatchIPs {
+				mismatchIPsList = append(mismatchIPsList, ip)
+			}
+			sort.Strings(statusIPsList)
+			sort.Strings(mismatchIPsList)
+			result = append(result, CriticalEIPInfo{
+				Resource:    resourceName,
+				Reason:      "all_mismatches",
+				StatusIPs:   statusIPsList,
+				MismatchIPs: mismatchIPsList,
+			})
+		}
+	}
+
+	// Sort by resource name
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Resource < result[j].Resource
+	})
+
+	return result, nil
+}
+
+// ListPrimaryEIPs returns a list of primary EIP assignments (first IP in each EIP resource's status.items)
+func (oc *OpenShiftClient) ListPrimaryEIPs(eipData map[string]interface{}) ([]PrimaryEIPInfo, error) {
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return []PrimaryEIPInfo{}, nil
+	}
+
+	var result []PrimaryEIPInfo
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get EIP resource name/namespace
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		statusItems, ok := status["items"].([]interface{})
+		if !ok || len(statusItems) == 0 {
+			continue
+		}
+
+		// Get the FIRST status item (Primary EIP)
+		firstStatusItem, ok := statusItems[0].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Check if the first IP is assigned to a node
+		nodeValue, ok := firstStatusItem["node"]
+		if !ok || nodeValue == nil {
+			continue
+		}
+
+		var nodeStr string
+		switch v := nodeValue.(type) {
+		case string:
+			nodeStr = v
+		default:
+			nodeStr = fmt.Sprintf("%v", v)
+		}
+
+		if nodeStr == "" {
+			continue
+		}
+
+		// Get IP from status item
+		spec, _ := itemMap["spec"].(map[string]interface{})
+		var configuredIPs []string
+		if spec != nil {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ipVal := range egressIPs {
+					if ipStr, ok := ipVal.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+		}
+
+		var ip string
+		if egressIPValue, hasIP := firstStatusItem["egressIP"]; hasIP {
+			switch v := egressIPValue.(type) {
+			case string:
+				ip = v
+			default:
+				ip = fmt.Sprintf("%v", v)
+			}
+		} else if len(configuredIPs) > 0 {
+			// Fall back to positional mapping
+			ip = configuredIPs[0]
+		}
+
+		if ip != "" {
+			result = append(result, PrimaryEIPInfo{
+				Resource: resourceName,
+				IP:       ip,
+				Node:     nodeStr,
+			})
+		}
+	}
+
+	// Sort by resource name
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].Resource < result[j].Resource
+	})
+
+	return result, nil
+}
+
+// ListSecondaryEIPs returns a list of secondary EIP assignments (second and subsequent IPs in each EIP resource's status.items)
+func (oc *OpenShiftClient) ListSecondaryEIPs(eipData map[string]interface{}) ([]SecondaryEIPInfo, error) {
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return []SecondaryEIPInfo{}, nil
+	}
+
+	var result []SecondaryEIPInfo
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get EIP resource name/namespace
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		statusItems, ok := status["items"].([]interface{})
+		if !ok || len(statusItems) <= 1 {
+			continue // Need at least 2 items for secondary EIPs
+		}
+
+		// Get configured IPs for positional mapping
+		spec, _ := itemMap["spec"].(map[string]interface{})
+		var configuredIPs []string
+		if spec != nil {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ipVal := range egressIPs {
+					if ipStr, ok := ipVal.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+		}
+
+		// Process items starting from index 1 (secondary EIPs)
+		for i := 1; i < len(statusItems); i++ {
+			statusItem, ok := statusItems[i].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Check if this item is assigned to a node
+			nodeValue, ok := statusItem["node"]
+			if !ok || nodeValue == nil {
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			if nodeStr == "" {
+				continue
+			}
+
+			// Get IP from status item
+			var ip string
+			if egressIPValue, hasIP := statusItem["egressIP"]; hasIP {
+				switch v := egressIPValue.(type) {
+				case string:
+					ip = v
+				default:
+					ip = fmt.Sprintf("%v", v)
+				}
+			} else if i < len(configuredIPs) {
+				// Fall back to positional mapping
+				ip = configuredIPs[i]
+			}
+
+			if ip != "" {
+				result = append(result, SecondaryEIPInfo{
+					Resource: resourceName,
+					IP:       ip,
+					Node:     nodeStr,
+					Index:    i,
+				})
+			}
+		}
+	}
+
+	// Sort by resource name, then by index
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Resource != result[j].Resource {
+			return result[i].Resource < result[j].Resource
+		}
+		return result[i].Index < result[j].Index
+	})
+
+	return result, nil
+}
+
 // DetectUnassignedEIPs finds EIPs that are configured but not assigned, and determines why
 // Uses the same logic as GetEIPStats: configured = len(spec.egressIPs), assigned = len(status.items with node)
 func (oc *OpenShiftClient) DetectUnassignedEIPs() ([]UnassignedEIP, error) {
@@ -5341,9 +5858,13 @@ func getColor(name string) color.Color {
 
 // Main CLI
 var (
-	outputDirVar     string
-	perfMonFlag      bool
-	infiniteLoopFlag bool
+	outputDirVar           string
+	perfMonFlag            bool
+	infiniteLoopFlag       bool
+	listMalfunctioningFlag bool
+	listCriticalFlag       bool
+	listPrimaryFlag        bool
+	listSecondaryFlag      bool
 )
 
 func validateEnvironment() (string, string, error) {
@@ -5590,11 +6111,142 @@ func PrintCurrentState() error {
 	return nil
 }
 
+// printMalfunctioningEIPs prints a list of malfunctioning EIP resources
+func printMalfunctioningEIPs(ocClient *OpenShiftClient) error {
+	eipData, cpicData, err := ocClient.FetchEIPAndCPICData()
+	if err != nil {
+		return err
+	}
+
+	malfunctioning, err := ocClient.ListMalfunctioningEIPs(eipData, cpicData)
+	if err != nil {
+		return err
+	}
+
+	if len(malfunctioning) == 0 {
+		fmt.Println("No malfunctioning EIPs found.")
+		return nil
+	}
+
+	fmt.Printf("Malfunctioning EIPs (%d):\n", len(malfunctioning))
+	for _, info := range malfunctioning {
+		fmt.Printf("\n  Resource: %s\n", info.Resource)
+		fmt.Printf("    Mismatches (%d):\n", len(info.Mismatches))
+		for _, m := range info.Mismatches {
+			if m.MismatchType == "node_mismatch" {
+				fmt.Printf("      IP: %s - EIP Node: %s, CPIC Node: %s (node mismatch)\n", m.IP, m.EIPNode, m.CPICNode)
+			} else if m.MismatchType == "missing_in_eip" {
+				fmt.Printf("      IP: %s - CPIC Node: %s (missing in EIP status)\n", m.IP, m.CPICNode)
+			} else {
+				fmt.Printf("      IP: %s - Type: %s\n", m.IP, m.MismatchType)
+			}
+		}
+	}
+
+	return nil
+}
+
+// printCriticalEIPs prints a list of critical EIP resources
+func printCriticalEIPs(ocClient *OpenShiftClient) error {
+	eipData, cpicData, err := ocClient.FetchEIPAndCPICData()
+	if err != nil {
+		return err
+	}
+
+	critical, err := ocClient.ListCriticalEIPs(eipData, cpicData)
+	if err != nil {
+		return err
+	}
+
+	if len(critical) == 0 {
+		fmt.Println("No critical EIPs found.")
+		return nil
+	}
+
+	fmt.Printf("Critical EIPs (%d):\n", len(critical))
+	for _, info := range critical {
+		fmt.Printf("\n  Resource: %s\n", info.Resource)
+		fmt.Printf("    Reason: %s\n", info.Reason)
+		if len(info.StatusIPs) > 0 {
+			fmt.Printf("    Status IPs: %s\n", strings.Join(info.StatusIPs, ", "))
+		}
+		if len(info.MismatchIPs) > 0 {
+			fmt.Printf("    Mismatch IPs: %s\n", strings.Join(info.MismatchIPs, ", "))
+		}
+	}
+
+	return nil
+}
+
+// printPrimaryEIPs prints a list of primary EIP assignments
+func printPrimaryEIPs(ocClient *OpenShiftClient) error {
+	eipData, _, err := ocClient.FetchEIPAndCPICData()
+	if err != nil {
+		return err
+	}
+
+	primary, err := ocClient.ListPrimaryEIPs(eipData)
+	if err != nil {
+		return err
+	}
+
+	if len(primary) == 0 {
+		fmt.Println("No primary EIPs found.")
+		return nil
+	}
+
+	fmt.Printf("Primary EIPs (%d):\n", len(primary))
+	for _, info := range primary {
+		fmt.Printf("  %s -> IP: %s, Node: %s\n", info.Resource, info.IP, info.Node)
+	}
+
+	return nil
+}
+
+// printSecondaryEIPs prints a list of secondary EIP assignments
+func printSecondaryEIPs(ocClient *OpenShiftClient) error {
+	eipData, _, err := ocClient.FetchEIPAndCPICData()
+	if err != nil {
+		return err
+	}
+
+	secondary, err := ocClient.ListSecondaryEIPs(eipData)
+	if err != nil {
+		return err
+	}
+
+	if len(secondary) == 0 {
+		fmt.Println("No secondary EIPs found.")
+		return nil
+	}
+
+	fmt.Printf("Secondary EIPs (%d):\n", len(secondary))
+	for _, info := range secondary {
+		fmt.Printf("  %s -> IP: %s, Node: %s (index %d)\n", info.Resource, info.IP, info.Node, info.Index)
+	}
+
+	return nil
+}
+
 func cmdMonitor() error {
 	// Verify system:admin access before proceeding
 	ocClient := NewOpenShiftClient()
 	if err := ocClient.VerifySystemAdminAccess(); err != nil {
 		return err
+	}
+
+	// Handle list flags - these run one iteration and exit
+	if listMalfunctioningFlag {
+		return printMalfunctioningEIPs(ocClient)
+	}
+	if listCriticalFlag {
+		return printCriticalEIPs(ocClient)
+	}
+	if listPrimaryFlag {
+		return printPrimaryEIPs(ocClient)
+	}
+	if listSecondaryFlag {
+		return printSecondaryEIPs(ocClient)
 	}
 
 	subscriptionID, resourceGroup, err := validateEnvironment()
@@ -5845,6 +6497,10 @@ func main() {
 	monitorCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 	monitorCmd.Flags().BoolVar(&perfMonFlag, "perfmon", false, "Enable performance monitoring")
 	monitorCmd.Flags().BoolVar(&infiniteLoopFlag, "infinite", false, "Run monitoring loop indefinitely (don't exit when monitoring is complete)")
+	monitorCmd.Flags().BoolVar(&listMalfunctioningFlag, "list-malfunctioning", false, "List malfunctioning EIP resources and exit")
+	monitorCmd.Flags().BoolVar(&listCriticalFlag, "list-critical", false, "List critical EIP resources and exit")
+	monitorCmd.Flags().BoolVar(&listPrimaryFlag, "list-primary", false, "List primary EIP assignments and exit")
+	monitorCmd.Flags().BoolVar(&listSecondaryFlag, "list-secondary", false, "List secondary EIP assignments and exit")
 
 	var mergeCmd = &cobra.Command{
 		Use:   "merge [directory]",
