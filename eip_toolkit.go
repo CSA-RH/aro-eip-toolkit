@@ -802,6 +802,14 @@ type UnassignedEIP struct {
 	CPICReason string // CPIC condition reason if available
 }
 
+// CPICAzureDiscrepancy represents a discrepancy between CPIC Success and Azure NIC IPs
+type CPICAzureDiscrepancy struct {
+	MissingInAzure []string          // IPs in CPIC Success but not on Azure NIC
+	MissingInCPIC  []string          // IPs on Azure NIC but not in CPIC Success
+	IPToResource   map[string]string // IP -> EIP resource name mapping
+	Message        string            // e.g., "CPIC Success (120) > Azure IPs (85), 35 missing in Azure"
+}
+
 // DetectEIPCPICMismatches compares EIP status.items node assignments with CPIC CloudResponseSuccess assignments
 // Returns a list of mismatches where the same IP is assigned to different nodes
 // Accounts for the constraint that only one IP can be assigned per node (to avoid false positives)
@@ -1127,130 +1135,103 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 	}
 
 	// Also check IPs that are configured in EIP spec.egressIPs but missing from EIP status.items
-	// If they have a CPIC with a node assigned (regardless of status), it's a mismatch
-	cpicAllData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
-	if err == nil {
-		cpicAllItems, ok := cpicAllData["items"].([]interface{})
-		if ok {
-			// Build map of all CPIC IPs with node assignments
-			cpicAllIPToNode := make(map[string]string)
-			for _, item := range cpicAllItems {
-				itemMap, ok := item.(map[string]interface{})
-				if !ok {
-					continue
-				}
+	// Only consider CPIC entries with CloudResponseSuccess status (successfully assigned)
+	// This avoids false positives from pending/error states that are still being processed
+	// Use pre-fetched cpicData to avoid redundant API call
+	cpicItems, ok := cpicData["items"].([]interface{})
+	if ok {
+		// Build map of CPIC IPs with CloudResponseSuccess status and node assignments
+		// This is similar to cpicIPToNode but we need to check all IPs, not just those already in the map
+		cpicAllIPToNode := make(map[string]string)
+		for _, item := range cpicItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
 
-				// Get IP address - try spec.ip first, fall back to resource name
-				var ipStr string
-				spec, ok := itemMap["spec"].(map[string]interface{})
+			// Get IP address - try spec.ip first, fall back to resource name
+			var ipStr string
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if ok {
+				ipValue, ok := spec["ip"]
 				if ok {
-					ipValue, ok := spec["ip"]
-					if ok {
-						switch v := ipValue.(type) {
-						case string:
-							ipStr = v
-						case nil:
-							// spec.ip is null, try resource name
+					switch v := ipValue.(type) {
+					case string:
+						ipStr = v
+					case nil:
+						// spec.ip is null, try resource name
+						break
+					default:
+						ipStr = fmt.Sprintf("%v", v)
+					}
+				}
+			}
+
+			// If spec.ip is null or empty, try using the resource name as the IP
+			if ipStr == "" {
+				metadata, ok := itemMap["metadata"].(map[string]interface{})
+				if ok {
+					if name, ok := metadata["name"].(string); ok && name != "" {
+						ipStr = name
+					}
+				}
+			}
+
+			if ipStr == "" {
+				continue
+			}
+
+			nodeValue, ok := spec["node"]
+			if !ok {
+				continue
+			}
+			nodeStr := ""
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+			if nodeStr == "" {
+				continue
+			}
+
+			// Only include CPIC entries with CloudResponseSuccess status to avoid false positives
+			// Pending/error states are still being processed and shouldn't be flagged as mismatches
+			status, ok := itemMap["status"].(map[string]interface{})
+			if ok {
+				conditions, ok := status["conditions"].([]interface{})
+				if ok {
+					hasCloudResponseSuccess := false
+					for _, cond := range conditions {
+						condMap, ok := cond.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						reason, _ := condMap["reason"].(string)
+						if reason == "CloudResponseSuccess" {
+							hasCloudResponseSuccess = true
 							break
-						default:
-							ipStr = fmt.Sprintf("%v", v)
 						}
 					}
-				}
-
-				// If spec.ip is null or empty, try using the resource name as the IP
-				if ipStr == "" {
-					metadata, ok := itemMap["metadata"].(map[string]interface{})
-					if ok {
-						if name, ok := metadata["name"].(string); ok && name != "" {
-							ipStr = name
-						}
-					}
-				}
-
-				if ipStr == "" {
-					continue
-				}
-
-				nodeValue, ok := spec["node"]
-				if !ok {
-					continue
-				}
-				nodeStr := ""
-				switch v := nodeValue.(type) {
-				case string:
-					nodeStr = v
-				case nil:
-					continue
-				default:
-					nodeStr = fmt.Sprintf("%v", v)
-				}
-				if nodeStr != "" {
-					cpicAllIPToNode[ipStr] = nodeStr
-				}
-			}
-
-			// Check IPs configured in EIP spec but not in EIP status.items
-			for ip, resourceName := range eipResourceMap {
-				_, existsInEIPStatus := eipIPToNode[ip]
-				if !existsInEIPStatus {
-					// IP is configured in EIP spec but not in EIP status.items
-					// Check if it has a CPIC with node assignment
-					if cpicNode, hasCPICNode := cpicAllIPToNode[ip]; hasCPICNode {
-						// IP has CPIC with node assignment but not in EIP status.items
-						// Check if we already reported this IP (from CloudResponseSuccess check above)
-						alreadyReported := false
-						for _, m := range mismatches {
-							if m.IP == ip && m.MismatchType == "missing_in_eip" {
-								alreadyReported = true
-								break
-							}
-						}
-						if !alreadyReported {
-							// Check if this EIP resource is at capacity
-							assignedCount := eipResourceAssigned[resourceName]
-							configuredCount := eipResourceConfig[resourceName]
-							isAtCapacity := false
-							if availableNodeCount > 0 {
-								maxPossibleAssignments := configuredCount
-								if configuredCount > availableNodeCount {
-									maxPossibleAssignments = availableNodeCount
-								}
-								if assignedCount >= maxPossibleAssignments {
-									isAtCapacity = true
-								}
-							}
-
-							if !isAtCapacity {
-								// This is a mismatch - IP has CPIC node assignment but not in EIP status.items, and resource isn't at capacity
-								mismatches = append(mismatches, EIPCPICMismatch{
-									IP:           ip,
-									EIPNode:      "",
-									CPICNode:     cpicNode,
-									EIPResource:  resourceName,
-									MismatchType: "missing_in_eip",
-								})
-							}
-						}
+					if hasCloudResponseSuccess {
+						cpicAllIPToNode[ipStr] = nodeStr
 					}
 				}
 			}
+		}
 
-			// Also check IPs in CPIC with node assignment but not in EIP status.items
-			// (This catches cases where IP might not be in eipResourceMap but is in CPIC)
-			// Exclude overcommitted resources
-			for ip, cpicNode := range cpicAllIPToNode {
-				_, existsInEIPStatus := eipIPToNode[ip]
-				if !existsInEIPStatus {
-					// IP is in CPIC with node assignment but not in EIP status.items
-					resourceName := eipResourceMap[ip]
-
-					// Skip IPs from overcommitted resources
-					if resourceName != "" && overcommittedResources[resourceName] {
-						continue
-					}
-
-					// Check if we already reported this IP
+		// Check IPs configured in EIP spec but not in EIP status.items
+		for ip, resourceName := range eipResourceMap {
+			_, existsInEIPStatus := eipIPToNode[ip]
+			if !existsInEIPStatus {
+				// IP is configured in EIP spec but not in EIP status.items
+				// Check if it has a CPIC with node assignment
+				if cpicNode, hasCPICNode := cpicAllIPToNode[ip]; hasCPICNode {
+					// IP has CPIC with node assignment but not in EIP status.items
+					// Check if we already reported this IP (from CloudResponseSuccess check above)
 					alreadyReported := false
 					for _, m := range mismatches {
 						if m.IP == ip && m.MismatchType == "missing_in_eip" {
@@ -1259,41 +1240,92 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 						}
 					}
 					if !alreadyReported {
-						if resourceName != "" {
-							// Check if this EIP resource is at capacity
-							assignedCount := eipResourceAssigned[resourceName]
-							configuredCount := eipResourceConfig[resourceName]
-							isAtCapacity := false
-							if availableNodeCount > 0 {
-								maxPossibleAssignments := configuredCount
-								if configuredCount > availableNodeCount {
-									maxPossibleAssignments = availableNodeCount
-								}
-								if assignedCount >= maxPossibleAssignments {
-									isAtCapacity = true
-								}
+						// Check if this EIP resource is at capacity
+						assignedCount := eipResourceAssigned[resourceName]
+						configuredCount := eipResourceConfig[resourceName]
+						isAtCapacity := false
+						if availableNodeCount > 0 {
+							maxPossibleAssignments := configuredCount
+							if configuredCount > availableNodeCount {
+								maxPossibleAssignments = availableNodeCount
 							}
+							if assignedCount >= maxPossibleAssignments {
+								isAtCapacity = true
+							}
+						}
 
-							if !isAtCapacity {
-								mismatches = append(mismatches, EIPCPICMismatch{
-									IP:           ip,
-									EIPNode:      "",
-									CPICNode:     cpicNode,
-									EIPResource:  resourceName,
-									MismatchType: "missing_in_eip",
-								})
-							}
-						} else {
-							// IP is in CPIC but we can't determine which EIP resource it belongs to
-							// Still flag as mismatch (orphaned CPIC)
+						if !isAtCapacity {
+							// This is a mismatch - IP has CPIC node assignment but not in EIP status.items, and resource isn't at capacity
 							mismatches = append(mismatches, EIPCPICMismatch{
 								IP:           ip,
 								EIPNode:      "",
 								CPICNode:     cpicNode,
-								EIPResource:  "",
+								EIPResource:  resourceName,
 								MismatchType: "missing_in_eip",
 							})
 						}
+					}
+				}
+			}
+		}
+
+		// Also check IPs in CPIC with node assignment but not in EIP status.items
+		// (This catches cases where IP might not be in eipResourceMap but is in CPIC)
+		// Exclude overcommitted resources
+		for ip, cpicNode := range cpicAllIPToNode {
+			_, existsInEIPStatus := eipIPToNode[ip]
+			if !existsInEIPStatus {
+				// IP is in CPIC with node assignment but not in EIP status.items
+				resourceName := eipResourceMap[ip]
+
+				// Skip IPs from overcommitted resources
+				if resourceName != "" && overcommittedResources[resourceName] {
+					continue
+				}
+
+				// Check if we already reported this IP
+				alreadyReported := false
+				for _, m := range mismatches {
+					if m.IP == ip && m.MismatchType == "missing_in_eip" {
+						alreadyReported = true
+						break
+					}
+				}
+				if !alreadyReported {
+					if resourceName != "" {
+						// Check if this EIP resource is at capacity
+						assignedCount := eipResourceAssigned[resourceName]
+						configuredCount := eipResourceConfig[resourceName]
+						isAtCapacity := false
+						if availableNodeCount > 0 {
+							maxPossibleAssignments := configuredCount
+							if configuredCount > availableNodeCount {
+								maxPossibleAssignments = availableNodeCount
+							}
+							if assignedCount >= maxPossibleAssignments {
+								isAtCapacity = true
+							}
+						}
+
+						if !isAtCapacity {
+							mismatches = append(mismatches, EIPCPICMismatch{
+								IP:           ip,
+								EIPNode:      "",
+								CPICNode:     cpicNode,
+								EIPResource:  resourceName,
+								MismatchType: "missing_in_eip",
+							})
+						}
+					} else {
+						// IP is in CPIC but we can't determine which EIP resource it belongs to
+						// Still flag as mismatch (orphaned CPIC)
+						mismatches = append(mismatches, EIPCPICMismatch{
+							IP:           ip,
+							EIPNode:      "",
+							CPICNode:     cpicNode,
+							EIPResource:  "",
+							MismatchType: "missing_in_eip",
+						})
 					}
 				}
 			}
@@ -2048,6 +2080,196 @@ func (oc *OpenShiftClient) GetNodeStats(nodeName string) (*NodeStats, error) {
 	return oc.GetNodeStatsFromData(nodeName, eipData, cpicData)
 }
 
+// DetectCPICAzureDiscrepancy detects discrepancies between CPIC Success IPs and Azure NIC IPs
+// Returns a CPICAzureDiscrepancy with details about which IPs are missing in each direction
+func (oc *OpenShiftClient) DetectCPICAzureDiscrepancy(nodeName string, eipData, cpicData map[string]interface{}, azureNICIPs []string) (*CPICAzureDiscrepancy, error) {
+	discrepancy := &CPICAzureDiscrepancy{
+		MissingInAzure: []string{},
+		MissingInCPIC:  []string{},
+		IPToResource:   make(map[string]string),
+	}
+
+	// Build set of Azure NIC IPs for quick lookup
+	azureIPSet := make(map[string]bool)
+	for _, ip := range azureNICIPs {
+		azureIPSet[ip] = true
+	}
+
+	// Build EIP resource map (IP -> resource name) from EIP data
+	eipResourceMap := make(map[string]string)
+	if eipData != nil {
+		eipItems, ok := eipData["items"].([]interface{})
+		if ok {
+			for _, item := range eipItems {
+				itemMap, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				metadata, ok := itemMap["metadata"].(map[string]interface{})
+				var resourceName string
+				if ok {
+					name, _ := metadata["name"].(string)
+					namespace, _ := metadata["namespace"].(string)
+					if namespace != "" {
+						resourceName = fmt.Sprintf("%s/%s", namespace, name)
+					} else {
+						resourceName = name
+					}
+				}
+
+				spec, ok := itemMap["spec"].(map[string]interface{})
+				if ok {
+					if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+						for _, ipVal := range egressIPs {
+							if ipStr, ok := ipVal.(string); ok {
+								eipResourceMap[ipStr] = resourceName
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Build set of CPIC Success IPs assigned to this node
+	cpicIPSet := make(map[string]bool)
+
+	items, ok := cpicData["items"].([]interface{})
+	if ok {
+		for _, item := range items {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Check if assigned to this node
+			nodeValue, ok := spec["node"]
+			if !ok {
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			if nodeStr != nodeName {
+				continue
+			}
+
+			// Check if CPIC has CloudResponseSuccess status
+			status, ok := itemMap["status"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			conditions, ok := status["conditions"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			hasCloudResponseSuccess := false
+			for _, cond := range conditions {
+				condMap, ok := cond.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				reason, _ := condMap["reason"].(string)
+				if reason == "CloudResponseSuccess" {
+					hasCloudResponseSuccess = true
+					break
+				}
+			}
+
+			if hasCloudResponseSuccess {
+				// Get IP address
+				var ipStr string
+				if ipValue, ok := spec["ip"]; ok {
+					switch v := ipValue.(type) {
+					case string:
+						ipStr = v
+					case nil:
+						// spec.ip is null, try resource name
+						if metadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+							if name, ok := metadata["name"].(string); ok && name != "" {
+								ipStr = name
+							}
+						}
+					default:
+						ipStr = fmt.Sprintf("%v", v)
+					}
+				} else {
+					// spec.ip doesn't exist, try resource name
+					if metadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+						if name, ok := metadata["name"].(string); ok && name != "" {
+							ipStr = name
+						}
+					}
+				}
+
+				if ipStr != "" {
+					cpicIPSet[ipStr] = true
+					// Track resource mapping if available
+					if resource, ok := eipResourceMap[ipStr]; ok {
+						discrepancy.IPToResource[ipStr] = resource
+					}
+				}
+			}
+		}
+	}
+
+	// Find IPs in CPIC but not on Azure NIC
+	for cpicIP := range cpicIPSet {
+		if !azureIPSet[cpicIP] {
+			discrepancy.MissingInAzure = append(discrepancy.MissingInAzure, cpicIP)
+			// Ensure resource mapping is tracked
+			if resource, ok := eipResourceMap[cpicIP]; ok {
+				discrepancy.IPToResource[cpicIP] = resource
+			}
+		}
+	}
+
+	// Find IPs on Azure NIC but not in CPIC Success
+	for azureIP := range azureIPSet {
+		if !cpicIPSet[azureIP] {
+			discrepancy.MissingInCPIC = append(discrepancy.MissingInCPIC, azureIP)
+		}
+	}
+
+	// Build message
+	cpicCount := len(cpicIPSet)
+	azureCount := len(azureIPSet)
+	missingInAzureCount := len(discrepancy.MissingInAzure)
+	missingInCPICCount := len(discrepancy.MissingInCPIC)
+
+	if missingInAzureCount > 0 && missingInCPICCount > 0 {
+		discrepancy.Message = fmt.Sprintf("CPIC Success (%d) vs Azure IPs (%d), %d missing in Azure, %d missing in CPIC",
+			cpicCount, azureCount, missingInAzureCount, missingInCPICCount)
+	} else if missingInAzureCount > 0 {
+		discrepancy.Message = fmt.Sprintf("CPIC Success (%d) > Azure IPs (%d), %d IPs missing in Azure",
+			cpicCount, azureCount, missingInAzureCount)
+	} else if missingInCPICCount > 0 {
+		discrepancy.Message = fmt.Sprintf("Azure IPs (%d) > CPIC Success (%d), %d IPs missing in CPIC",
+			azureCount, cpicCount, missingInCPICCount)
+	} else {
+		// No discrepancy
+		discrepancy.Message = ""
+	}
+
+	return discrepancy, nil
+}
+
 // AzureClient handles Azure CLI operations
 type AzureClient struct {
 	subscriptionID string
@@ -2131,6 +2353,34 @@ func (ac *AzureClient) GetNodeNICStats(nodeName string) (int, int, error) {
 	secondaryLBIPs := max(0, lbAssociated-1)
 
 	return secondaryIPs, secondaryLBIPs, nil
+}
+
+// GetNodeNICIPs returns the list of actual IP addresses configured on the Azure NIC
+func (ac *AzureClient) GetNodeNICIPs(nodeName string) ([]string, error) {
+	nicName := fmt.Sprintf("%s-nic", nodeName)
+
+	// Get IP configurations
+	ipConfigsResult, err := ac.RunCommand([]string{"network", "nic", "show",
+		"--resource-group", ac.resourceGroup,
+		"--name", nicName,
+		"--query", "ipConfigurations[].privateIPAddress"})
+	if err != nil {
+		return nil, err
+	}
+
+	ipConfigs, ok := ipConfigsResult.([]interface{})
+	if !ok {
+		return []string{}, nil
+	}
+
+	ips := make([]string, 0, len(ipConfigs))
+	for _, ipVal := range ipConfigs {
+		if ipStr, ok := ipVal.(string); ok && ipStr != "" {
+			ips = append(ips, ipStr)
+		}
+	}
+
+	return ips, nil
 }
 
 func max(a, b int) int {
@@ -2280,6 +2530,7 @@ type NodeEIPData struct {
 	CPICError     int
 	Capacity      int        // IP capacity from node annotations
 	Status        NodeStatus // Node readiness status
+	Discrepancy   *CPICAzureDiscrepancy
 }
 
 func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpicData map[string]interface{}) *NodeEIPData {
@@ -2305,6 +2556,23 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 
 	nodeStats.AzureEIPs = azureEIPs
 	nodeStats.AzureLBs = azureLBs
+
+	// Get Azure NIC IPs list for discrepancy detection
+	var discrepancy *CPICAzureDiscrepancy
+	if cpicData != nil {
+		azureNICIPs, err := em.azClient.GetNodeNICIPs(node)
+		if err != nil {
+			log.Printf("Error getting Azure NIC IPs for node %s: %v", node, err)
+			// Continue without discrepancy detection if Azure query fails
+		} else {
+			// Detect discrepancies between CPIC Success and Azure NIC IPs
+			discrepancy, err = em.ocClient.DetectCPICAzureDiscrepancy(node, eipData, cpicData, azureNICIPs)
+			if err != nil {
+				log.Printf("Error detecting CPIC/Azure discrepancy for node %s: %v", node, err)
+				// Continue without discrepancy info if detection fails
+			}
+		}
+	}
 
 	// Get node IP capacity
 	capacity, err := em.ocClient.GetNodeCapacity(node)
@@ -2355,6 +2623,7 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 		CPICError:     nodeStats.CPICError,
 		Capacity:      capacity,
 		Status:        nodeStatus,
+		Discrepancy:   discrepancy,
 	}
 }
 
@@ -2645,6 +2914,65 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 			fmt.Printf("%s%s%s\n",
 				clearLine, nodeNameStr, outputStr)
+
+			// Display CPIC/Azure discrepancy details if detected and no progress for 10 iterations
+			if data.Discrepancy != nil && data.Discrepancy.Message != "" && noProgressDetected {
+				fmt.Printf("%s\033[33;1m⚠️  CPIC/Azure Discrepancy: %s\033[0m\n",
+					clearLine, data.Discrepancy.Message)
+
+				// Show detailed IPs (limit to first 10 for readability)
+				maxDisplay := 10
+				missingInAzureCount := len(data.Discrepancy.MissingInAzure)
+				missingInCPICCount := len(data.Discrepancy.MissingInCPIC)
+
+				if missingInAzureCount > 0 {
+					displayCount := missingInAzureCount
+					if displayCount > maxDisplay {
+						displayCount = maxDisplay
+					}
+
+					if missingInAzureCount > maxDisplay {
+						fmt.Printf("%s   Missing in Azure (%d shown of %d):\n", clearLine, displayCount, missingInAzureCount)
+					} else {
+						fmt.Printf("%s   Missing in Azure:\n", clearLine)
+					}
+
+					// Sort IPs for consistent output
+					sortedIPs := make([]string, displayCount)
+					copy(sortedIPs, data.Discrepancy.MissingInAzure[:displayCount])
+					sort.Strings(sortedIPs)
+
+					for _, ip := range sortedIPs {
+						displayStr := ip
+						if resource, ok := data.Discrepancy.IPToResource[ip]; ok && resource != "" {
+							displayStr = fmt.Sprintf("%s (%s)", ip, resource)
+						}
+						fmt.Printf("%s   - %s\n", clearLine, displayStr)
+					}
+				}
+
+				if missingInCPICCount > 0 {
+					displayCount := missingInCPICCount
+					if displayCount > maxDisplay {
+						displayCount = maxDisplay
+					}
+
+					if missingInCPICCount > maxDisplay {
+						fmt.Printf("%s   Missing in CPIC (%d shown of %d):\n", clearLine, displayCount, missingInCPICCount)
+					} else {
+						fmt.Printf("%s   Missing in CPIC:\n", clearLine)
+					}
+
+					// Sort IPs for consistent output
+					sortedIPs := make([]string, displayCount)
+					copy(sortedIPs, data.Discrepancy.MissingInCPIC[:displayCount])
+					sort.Strings(sortedIPs)
+
+					for _, ip := range sortedIPs {
+						fmt.Printf("%s   - %s\n", clearLine, ip)
+					}
+				}
+			}
 
 			// Log status changes
 			if hasPrev && prev.Status != data.Status {
