@@ -4238,6 +4238,7 @@ func (dp *DataProcessor) MergeLogs() error {
 		"cluster_summary_avg_eips_per_node.log",
 		"malfunctioning_eip_objects_count.log",
 		"overcommitted_eip_objects_count.log",
+		"critical_eip_objects_count.log",
 		"eip_cpic_mismatches_total.log",
 		"eip_cpic_mismatches_node_mismatch.log",
 		"eip_cpic_mismatches_missing_in_eip.log",
@@ -4561,6 +4562,7 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 		"ocp_cpic_error.dat",   // Cluster-level CPIC (not per-node)
 		"malfunctioning_eip_objects_count.dat",
 		"overcommitted_eip_objects_count.dat",
+		"critical_eip_objects_count.dat",
 		"eip_cpic_mismatches_total.dat",
 		"eip_cpic_mismatches_node_mismatch.dat",
 		"eip_cpic_mismatches_missing_in_eip.dat",
@@ -5012,6 +5014,7 @@ func (pg *PlotGenerator) GenerateDashboardPlot() error {
 		"CPIC Errors":    "ocp_cpic_error.dat",
 		"Malfunctioning": "malfunctioning_eip_objects_count.dat",
 		"Overcommitted":  "overcommitted_eip_objects_count.dat",
+		"Critical":       "critical_eip_objects_count.dat",
 	}
 
 	// Load per-node metrics

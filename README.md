@@ -458,6 +458,7 @@ All logged metrics are automatically plotted. The following metrics are logged t
 - `cluster_summary_avg_eips_per_node.log`
 - `malfunctioning_eip_objects_count.log` - Number of EIP resources with mismatches
 - `overcommitted_eip_objects_count.log` - Number of EIP resources overcommitted
+- `critical_eip_objects_count.log` - Number of EIP resources with no working node assignments
 - `eip_cpic_mismatches_total.log` - Total mismatch count (only logged after 10 iterations without progress)
 - `eip_cpic_mismatches_node_mismatch.log` - Node assignment mismatches
 - `eip_cpic_mismatches_missing_in_eip.log` - IPs in CPIC but not in EIP status
