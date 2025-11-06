@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -167,13 +168,25 @@ func (bl *BufferedLogger) LogStats(timestamp, statsType string, stats map[string
 	bl.mu.Lock()
 	defer bl.mu.Unlock()
 
+	// Pre-allocate string builder for better performance
+	var sb strings.Builder
+	sb.Grow(64) // Pre-allocate reasonable size
+
 	for statName, value := range stats {
-		key := fmt.Sprintf("%s_%s", statsType, statName)
+		// Build key string more efficiently
+		key := statsType + "_" + statName
 		if bl.buffers[key] == nil {
 			bl.buffers[key] = make([]string, 0, bl.bufferSize)
 		}
 
-		line := fmt.Sprintf("%s %v\n", timestamp, value)
+		// Build line more efficiently (reuse builder)
+		sb.Reset()
+		sb.WriteString(timestamp)
+		sb.WriteByte(' ')
+		sb.WriteString(fmt.Sprintf("%v", value))
+		sb.WriteByte('\n')
+		line := sb.String()
+
 		bl.buffers[key] = append(bl.buffers[key], line)
 
 		if len(bl.buffers[key]) >= bl.bufferSize {
@@ -199,10 +212,15 @@ func (bl *BufferedLogger) flushBuffer(key string) error {
 	}
 	defer f.Close()
 
+	// Batch write all lines at once for better performance
+	var sb strings.Builder
+	sb.Grow(len(lines) * 64) // Pre-allocate based on expected line length
 	for _, line := range lines {
-		if _, err := f.WriteString(line); err != nil {
-			return err
-		}
+		sb.WriteString(line)
+	}
+
+	if _, err := f.WriteString(sb.String()); err != nil {
+		return err
 	}
 
 	bl.buffers[key] = bl.buffers[key][:0]
@@ -258,17 +276,34 @@ func (oc *OpenShiftClient) RunCommand(cmd []string) (map[string]interface{}, err
 	return result, nil
 }
 
-// FetchEIPAndCPICData fetches both EIP and CPIC data in a single operation
-// This reduces API calls when both are needed together
+// FetchEIPAndCPICData fetches both EIP and CPIC data in parallel
+// This reduces API call latency by fetching both simultaneously
 func (oc *OpenShiftClient) FetchEIPAndCPICData() (map[string]interface{}, map[string]interface{}, error) {
-	eipData, err := oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get EIP data: %w", err)
-	}
+	var eipData map[string]interface{}
+	var cpicData map[string]interface{}
+	var eipErr, cpicErr error
 
-	cpicData, err := oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get CPIC data: %w", err)
+	// Fetch both in parallel
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		eipData, eipErr = oc.RunCommand([]string{"get", "eip", "--all-namespaces", "-o", "json"})
+	}()
+
+	go func() {
+		defer wg.Done()
+		cpicData, cpicErr = oc.RunCommand([]string{"get", "cloudprivateipconfig", "--all-namespaces", "-o", "json"})
+	}()
+
+	wg.Wait()
+
+	if eipErr != nil {
+		return nil, nil, fmt.Errorf("failed to get EIP data: %w", eipErr)
+	}
+	if cpicErr != nil {
+		return nil, nil, fmt.Errorf("failed to get CPIC data: %w", cpicErr)
 	}
 
 	return eipData, cpicData, nil
@@ -591,99 +626,100 @@ func (oc *OpenShiftClient) GetCNCCStats() (*CNCCStats, error) {
 	}, nil
 }
 
-func (oc *OpenShiftClient) GetNodeCapacity(nodeName string) (int, error) {
-	// Get node annotations to check IP capacity (it's in annotations, not labels)
-	nodeData, err := oc.RunCommand([]string{"get", "node", nodeName, "-o", "json"})
-	if err != nil {
-		return 0, err
-	}
-
-	metadata, ok := nodeData["metadata"].(map[string]interface{})
-	if !ok {
-		return 0, fmt.Errorf("invalid metadata format")
-	}
-
-	// Get egress IP config from annotations
-	annotations, ok := metadata["annotations"].(map[string]interface{})
-	if !ok {
-		return 0, nil // No annotations, return 0 (unknown capacity)
-	}
-
-	egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
-	if !ok || egressIPConfig == "" {
-		return 0, nil // No egress IP config annotation
-	}
-
-	// Parse the annotation/label JSON to extract capacity
-	// The value is a JSON string like: [{"interface":"...","ifaddr":{"ipv4":"10.0.2.0/23"},"capacity":{"ip":255}}]
-	var configs []map[string]interface{}
-	if err := json.Unmarshal([]byte(egressIPConfig), &configs); err != nil {
-		return 0, nil // Failed to parse, return 0
-	}
-
-	// Sum up all capacities from all interfaces
-	totalCapacity := 0
-	for _, config := range configs {
-		capacity, ok := config["capacity"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		ip, ok := capacity["ip"].(float64)
-		if ok {
-			totalCapacity += int(ip)
-		}
-	}
-
-	return totalCapacity, nil
+// NodeData contains capacity and status from a single node query
+type NodeData struct {
+	Capacity int
+	Status   NodeStatus
 }
 
-func (oc *OpenShiftClient) GetNodeStatus(nodeName string) (NodeStatus, error) {
-	// Get node to check status
+// GetNodeData fetches both capacity and status in a single query
+func (oc *OpenShiftClient) GetNodeData(nodeName string) (*NodeData, error) {
+	// Get node data once
 	nodeData, err := oc.RunCommand([]string{"get", "node", nodeName, "-o", "json"})
 	if err != nil {
-		return NodeStatusUnknown, err
+		return &NodeData{Capacity: 0, Status: NodeStatusUnknown}, err
 	}
 
-	// Check for unschedulable taint (SchedulingDisabled)
-	spec, ok := nodeData["spec"].(map[string]interface{})
+	result := &NodeData{Capacity: 0, Status: NodeStatusUnknown}
+
+	// Extract capacity
+	metadata, ok := nodeData["metadata"].(map[string]interface{})
 	if ok {
-		unschedulable, ok := spec["unschedulable"].(bool)
-		if ok && unschedulable {
-			return NodeStatusSchedulingDisabled, nil
-		}
-	}
-
-	// Check Ready condition
-	status, ok := nodeData["status"].(map[string]interface{})
-	if !ok {
-		return NodeStatusUnknown, nil
-	}
-
-	conditions, ok := status["conditions"].([]interface{})
-	if !ok {
-		return NodeStatusUnknown, nil
-	}
-
-	for _, cond := range conditions {
-		condMap, ok := cond.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		typeStr, _ := condMap["type"].(string)
-		if typeStr == "Ready" {
-			statusStr, _ := condMap["status"].(string)
-			if statusStr == "True" {
-				return NodeStatusReady, nil
-			} else {
-				return NodeStatusNotReady, nil
+		annotations, ok := metadata["annotations"].(map[string]interface{})
+		if ok {
+			egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
+			if ok && egressIPConfig != "" {
+				var configs []map[string]interface{}
+				if err := json.Unmarshal([]byte(egressIPConfig), &configs); err == nil {
+					totalCapacity := 0
+					for _, config := range configs {
+						capacity, ok := config["capacity"].(map[string]interface{})
+						if ok {
+							ip, ok := capacity["ip"].(float64)
+							if ok {
+								totalCapacity += int(ip)
+							}
+						}
+					}
+					result.Capacity = totalCapacity
+				}
 			}
 		}
 	}
 
-	// If no Ready condition found, check if node is marked as unschedulable
-	// This could also mean the node is not ready
-	return NodeStatusNotReady, nil
+	// Extract status
+	spec, ok := nodeData["spec"].(map[string]interface{})
+	if ok {
+		unschedulable, ok := spec["unschedulable"].(bool)
+		if ok && unschedulable {
+			result.Status = NodeStatusSchedulingDisabled
+			return result, nil
+		}
+	}
+
+	status, ok := nodeData["status"].(map[string]interface{})
+	if ok {
+		conditions, ok := status["conditions"].([]interface{})
+		if ok {
+			for _, cond := range conditions {
+				condMap, ok := cond.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				typeStr, _ := condMap["type"].(string)
+				if typeStr == "Ready" {
+					statusStr, _ := condMap["status"].(string)
+					if statusStr == "True" {
+						result.Status = NodeStatusReady
+					} else {
+						result.Status = NodeStatusNotReady
+					}
+					return result, nil
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// GetNodeCapacity returns node capacity (kept for backward compatibility)
+func (oc *OpenShiftClient) GetNodeCapacity(nodeName string) (int, error) {
+	data, err := oc.GetNodeData(nodeName)
+	if err != nil {
+		return 0, err
+	}
+	return data.Capacity, nil
+}
+
+// GetNodeStatus returns node status (kept for backward compatibility)
+func (oc *OpenShiftClient) GetNodeStatus(nodeName string) (NodeStatus, error) {
+	data, err := oc.GetNodeData(nodeName)
+	if err != nil {
+		return NodeStatusUnknown, err
+	}
+	return data.Status, nil
 }
 
 // GetIPToNodeMapping builds a mapping of IP addresses to assigned nodes from CPIC objects
@@ -2454,48 +2490,53 @@ func (ac *AzureClient) RunCommand(cmd []string) (interface{}, error) {
 	return result, nil
 }
 
-func (ac *AzureClient) GetNodeNICStats(nodeName string) (int, int, error) {
+// NodeNICData contains all data from a single Azure NIC query
+type NodeNICData struct {
+	EIPs int      // Number of secondary EIPs (total IPs - 1)
+	LBs  int      // Number of secondary LB IPs
+	IPs  []string // List of all IP addresses
+}
+
+// GetNodeNICData fetches all NIC data in a single query to reduce API calls
+func (ac *AzureClient) GetNodeNICData(nodeName string) (*NodeNICData, error) {
 	nicName := fmt.Sprintf("%s-nic", nodeName)
 
-	// Get IP configurations
-	ipConfigsResult, err := ac.RunCommand([]string{"network", "nic", "show",
+	// Get full NIC data in one call
+	nicData, err := ac.RunCommand([]string{"network", "nic", "show",
 		"--resource-group", ac.resourceGroup,
 		"--name", nicName,
-		"--query", "ipConfigurations[].privateIPAddress"})
+		"--query", "{ipConfigs:ipConfigurations}"})
 	if err != nil {
-		return 0, 0, err
+		return nil, err
 	}
 
-	ipConfigs, ok := ipConfigsResult.([]interface{})
+	nicMap, ok := nicData.(map[string]interface{})
 	if !ok {
-		return 0, 0, nil
+		return &NodeNICData{EIPs: 0, LBs: 0, IPs: []string{}}, nil
 	}
 
-	// Get load balancer associations
-	lbConfigsResult, err := ac.RunCommand([]string{"network", "nic", "show",
-		"--resource-group", ac.resourceGroup,
-		"--name", nicName,
-		"--query", "ipConfigurations[].{pools:loadBalancerBackendAddressPools[].id}"})
-	if err != nil {
-		return max(0, len(ipConfigs)-1), 0, nil
-	}
-
-	lbConfigs, ok := lbConfigsResult.([]interface{})
-	if !ok {
-		return max(0, len(ipConfigs)-1), 0, nil
+	ipConfigs, ok := nicMap["ipConfigs"].([]interface{})
+	if !ok || len(ipConfigs) == 0 {
+		return &NodeNICData{EIPs: 0, LBs: 0, IPs: []string{}}, nil
 	}
 
 	totalIPs := len(ipConfigs)
+	ips := make([]string, 0, totalIPs)
 	lbAssociated := 0
 
-	for _, cfg := range lbConfigs {
+	for _, cfg := range ipConfigs {
 		cfgMap, ok := cfg.(map[string]interface{})
 		if !ok {
 			continue
 		}
 
-		pools, ok := cfgMap["pools"].([]interface{})
-		if ok && len(pools) > 0 {
+		// Extract IP address
+		if ipAddr, ok := cfgMap["privateIPAddress"].(string); ok && ipAddr != "" {
+			ips = append(ips, ipAddr)
+		}
+
+		// Check for load balancer associations
+		if lbPools, ok := cfgMap["loadBalancerBackendAddressPools"].([]interface{}); ok && len(lbPools) > 0 {
 			lbAssociated++
 		}
 	}
@@ -2503,35 +2544,29 @@ func (ac *AzureClient) GetNodeNICStats(nodeName string) (int, int, error) {
 	secondaryIPs := max(0, totalIPs-1)
 	secondaryLBIPs := max(0, lbAssociated-1)
 
-	return secondaryIPs, secondaryLBIPs, nil
+	return &NodeNICData{
+		EIPs: secondaryIPs,
+		LBs:  secondaryLBIPs,
+		IPs:  ips,
+	}, nil
 }
 
-// GetNodeNICIPs returns the list of actual IP addresses configured on the Azure NIC
-func (ac *AzureClient) GetNodeNICIPs(nodeName string) ([]string, error) {
-	nicName := fmt.Sprintf("%s-nic", nodeName)
+// GetNodeNICStats returns EIP and LB counts (kept for backward compatibility)
+func (ac *AzureClient) GetNodeNICStats(nodeName string) (int, int, error) {
+	data, err := ac.GetNodeNICData(nodeName)
+	if err != nil {
+		return 0, 0, err
+	}
+	return data.EIPs, data.LBs, nil
+}
 
-	// Get IP configurations
-	ipConfigsResult, err := ac.RunCommand([]string{"network", "nic", "show",
-		"--resource-group", ac.resourceGroup,
-		"--name", nicName,
-		"--query", "ipConfigurations[].privateIPAddress"})
+// GetNodeNICIPs returns the list of actual IP addresses (kept for backward compatibility)
+func (ac *AzureClient) GetNodeNICIPs(nodeName string) ([]string, error) {
+	data, err := ac.GetNodeNICData(nodeName)
 	if err != nil {
 		return nil, err
 	}
-
-	ipConfigs, ok := ipConfigsResult.([]interface{})
-	if !ok {
-		return []string{}, nil
-	}
-
-	ips := make([]string, 0, len(ipConfigs))
-	for _, ipVal := range ipConfigs {
-		if ipStr, ok := ipVal.(string); ok && ipStr != "" {
-			ips = append(ips, ipStr)
-		}
-	}
-
-	return ips, nil
+	return data.IPs, nil
 }
 
 func max(a, b int) int {
@@ -2567,6 +2602,60 @@ func calculateSubnetSize(cidr string) int {
 	return 1 << hostBits // 2^hostBits
 }
 
+// PerformanceMonitor tracks resource usage and performance metrics
+type PerformanceMonitor struct {
+	startTime     time.Time
+	startMemStats runtime.MemStats
+	endTime       time.Time
+	endMemStats   runtime.MemStats
+	iterations    int
+	apiCallCount  int
+}
+
+// Start begins tracking performance metrics
+func (pm *PerformanceMonitor) Start() {
+	pm.startTime = time.Now()
+	runtime.GC() // Force GC before starting to get baseline
+	runtime.ReadMemStats(&pm.startMemStats)
+	pm.iterations = 0
+	pm.apiCallCount = 0
+}
+
+// Stop ends tracking and captures final metrics
+func (pm *PerformanceMonitor) Stop() {
+	pm.endTime = time.Now()
+	runtime.GC() // Force GC before ending to get accurate final stats
+	runtime.ReadMemStats(&pm.endMemStats)
+}
+
+// GetDuration returns the total runtime duration
+func (pm *PerformanceMonitor) GetDuration() time.Duration {
+	return pm.endTime.Sub(pm.startTime)
+}
+
+// GetMemoryStats returns memory usage statistics
+func (pm *PerformanceMonitor) GetMemoryStats() (peakHeapAlloc, currentHeapAlloc, heapSys, numGC uint64) {
+	peakHeapAlloc = pm.endMemStats.HeapAlloc
+	currentHeapAlloc = pm.endMemStats.HeapAlloc
+	heapSys = pm.endMemStats.HeapSys
+	numGC = uint64(pm.endMemStats.NumGC - pm.startMemStats.NumGC)
+	return
+}
+
+// FormatBytes formats bytes to human-readable format
+func formatBytes(bytes uint64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := uint64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
 // EIPMonitor handles monitoring operations
 type EIPMonitor struct {
 	outputDir      string
@@ -2576,6 +2665,23 @@ type EIPMonitor struct {
 	ocClient       *OpenShiftClient
 	azClient       *AzureClient
 	bufferedLogger *BufferedLogger
+	perfMonitor    *PerformanceMonitor
+	// Cache for node data that rarely changes
+	nodeCache                 map[string]*NodeCacheData
+	nodeCacheMutex            sync.RWMutex
+	cnccCache                 *CNCCStats
+	cnccCacheTime             time.Time
+	cnccCacheMutex            sync.RWMutex
+	clusterCapacityCache      int
+	clusterCapacityCacheTime  time.Time
+	clusterCapacityCacheMutex sync.RWMutex
+}
+
+// NodeCacheData caches node capacity and status (they rarely change)
+type NodeCacheData struct {
+	Capacity   int
+	Status     NodeStatus
+	LastUpdate time.Time
 }
 
 func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor, error) {
@@ -2597,6 +2703,8 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor
 		ocClient:       NewOpenShiftClient(),
 		azClient:       NewAzureClient(subscriptionID, resourceGroup),
 		bufferedLogger: NewBufferedLogger(logsDir, 100),
+		perfMonitor:    &PerformanceMonitor{},
+		nodeCache:      make(map[string]*NodeCacheData),
 	}, nil
 }
 
@@ -2701,44 +2809,59 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 		return nil
 	}
 
-	azureEIPs, azureLBs, err := em.azClient.GetNodeNICStats(node)
+	// Get Azure NIC data in a single call (optimization: combines stats and IPs)
+	nicData, err := em.azClient.GetNodeNICData(node)
 	if err != nil {
-		log.Printf("Error getting Azure stats for node %s: %v", node, err)
-		azureEIPs, azureLBs = 0, 0
+		log.Printf("Error getting Azure NIC data for node %s: %v", node, err)
+		nicData = &NodeNICData{EIPs: 0, LBs: 0, IPs: []string{}}
 	}
 
-	nodeStats.AzureEIPs = azureEIPs
-	nodeStats.AzureLBs = azureLBs
+	nodeStats.AzureEIPs = nicData.EIPs
+	nodeStats.AzureLBs = nicData.LBs
 
-	// Get Azure NIC IPs list for discrepancy detection
+	// Detect discrepancies between CPIC Success and Azure NIC IPs (only if needed)
+	// Skip if CPIC Success matches Azure EIPs count (no discrepancy expected)
 	var discrepancy *CPICAzureDiscrepancy
-	if cpicData != nil {
-		azureNICIPs, err := em.azClient.GetNodeNICIPs(node)
+	if cpicData != nil && len(nicData.IPs) > 0 && nodeStats.CPICSuccess != nicData.EIPs {
+		// Only run detection if there's a count mismatch (optimization)
+		discrepancy, err = em.ocClient.DetectCPICAzureDiscrepancy(node, eipData, cpicData, nicData.IPs)
 		if err != nil {
-			log.Printf("Error getting Azure NIC IPs for node %s: %v", node, err)
-			// Continue without discrepancy detection if Azure query fails
-		} else {
-			// Detect discrepancies between CPIC Success and Azure NIC IPs
-			discrepancy, err = em.ocClient.DetectCPICAzureDiscrepancy(node, eipData, cpicData, azureNICIPs)
-			if err != nil {
-				log.Printf("Error detecting CPIC/Azure discrepancy for node %s: %v", node, err)
-				// Continue without discrepancy info if detection fails
-			}
+			log.Printf("Error detecting CPIC/Azure discrepancy for node %s: %v", node, err)
+			// Continue without discrepancy info if detection fails
 		}
 	}
 
-	// Get node IP capacity
-	capacity, err := em.ocClient.GetNodeCapacity(node)
-	if err != nil {
-		log.Printf("Error getting capacity for node %s: %v", node, err)
-		capacity = 0 // Unknown capacity
-	}
+	// Get node capacity and status (cached, as they rarely change)
+	capacity := 0
+	nodeStatus := NodeStatusUnknown
 
-	// Get node status
-	nodeStatus, err := em.ocClient.GetNodeStatus(node)
-	if err != nil {
-		log.Printf("Error getting status for node %s: %v", node, err)
-		nodeStatus = NodeStatusUnknown
+	// Check cache first (5 minute TTL)
+	em.nodeCacheMutex.RLock()
+	cached, exists := em.nodeCache[node]
+	cacheValid := exists && time.Since(cached.LastUpdate) < 5*time.Minute
+	em.nodeCacheMutex.RUnlock()
+
+	if cacheValid {
+		capacity = cached.Capacity
+		nodeStatus = cached.Status
+	} else {
+		// Fetch node data (combines capacity and status in one call)
+		nodeData, err := em.ocClient.GetNodeData(node)
+		if err != nil {
+			log.Printf("Error getting node data for %s: %v", node, err)
+		} else {
+			capacity = nodeData.Capacity
+			nodeStatus = nodeData.Status
+
+			// Update cache
+			em.nodeCacheMutex.Lock()
+			em.nodeCache[node] = &NodeCacheData{
+				Capacity:   capacity,
+				Status:     nodeStatus,
+				LastUpdate: time.Now(),
+			}
+			em.nodeCacheMutex.Unlock()
+		}
 	}
 
 	// Log node statistics
@@ -2769,8 +2892,8 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 		Node:          node,
 		EIPAssigned:   nodeStats.EIPAssigned,
 		SecondaryEIPs: nodeStats.SecondaryEIPs,
-		AzureEIPs:     azureEIPs,
-		AzureLBs:      azureLBs,
+		AzureEIPs:     nicData.EIPs,
+		AzureLBs:      nicData.LBs,
 		CPICSuccess:   nodeStats.CPICSuccess,
 		CPICPending:   nodeStats.CPICPending,
 		CPICError:     nodeStats.CPICError,
@@ -2782,40 +2905,43 @@ func (em *EIPMonitor) CollectSingleNodeData(node, timestamp string, eipData, cpi
 
 func (em *EIPMonitor) CollectNodeDataParallel(nodes []string, timestamp string, eipData, cpicData map[string]interface{}) []*NodeEIPData {
 	var wg sync.WaitGroup
-	var mu sync.Mutex
-	results := make([]*NodeEIPData, 0, len(nodes))
+	// Pre-allocate results slice with exact size to avoid mutex-protected append
+	results := make([]*NodeEIPData, len(nodes))
 
 	maxWorkers := len(nodes)
-	if maxWorkers > 10 {
-		maxWorkers = 10
+	if maxWorkers > 20 {
+		maxWorkers = 20 // Increased from 10 to 20 for better parallelism
 	}
 
 	sem := make(chan struct{}, maxWorkers)
 
-	for _, node := range nodes {
+	// Use index-based approach to avoid mutex contention
+	for i, node := range nodes {
 		wg.Add(1)
-		go func(n string) {
+		go func(idx int, n string) {
 			defer wg.Done()
 			sem <- struct{}{}        // Acquire semaphore
 			defer func() { <-sem }() // Release semaphore
 
-			data := em.CollectSingleNodeData(n, timestamp, eipData, cpicData)
-			if data != nil {
-				mu.Lock()
-				results = append(results, data)
-				mu.Unlock()
-			}
-		}(node)
+			results[idx] = em.CollectSingleNodeData(n, timestamp, eipData, cpicData)
+		}(i, node)
 	}
 
 	wg.Wait()
 
-	// Sort results by node name for consistent ordering
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Node < results[j].Node
+	// Filter out nil results and sort by node name for consistent ordering
+	validResults := make([]*NodeEIPData, 0, len(nodes))
+	for _, result := range results {
+		if result != nil {
+			validResults = append(validResults, result)
+		}
+	}
+
+	sort.Slice(validResults, func(i, j int) bool {
+		return validResults[i].Node < validResults[j].Node
 	})
 
-	return results
+	return validResults
 }
 
 func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPData) error {
@@ -2876,12 +3002,39 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 func (em *EIPMonitor) MonitorLoop() error {
 	log.Println("Starting EIP monitoring loop...")
 
+	// Start performance monitoring
+	em.perfMonitor.Start()
+
+	// Ensure we stop performance monitoring even on early exit
+	defer func() {
+		// Always stop and display if monitoring was started (check if startTime is set)
+		if !em.perfMonitor.startTime.IsZero() {
+			log.Println("Stopping performance monitor and displaying stats...")
+			em.perfMonitor.Stop()
+			em.displayPerformanceStats()
+		} else {
+			log.Println("Performance monitor was not started (startTime is zero)")
+		}
+	}()
+
 	nodes, err := em.ocClient.GetEIPEnabledNodes()
 	if err != nil {
 		return err
 	}
 	sort.Strings(nodes) // Ensure consistent ordering
 	log.Printf("Found EIP-enabled nodes: %v", nodes)
+
+	// Pre-warm node cache in parallel (optimization: fetch capacity/status upfront)
+	var cacheWg sync.WaitGroup
+	for _, node := range nodes {
+		cacheWg.Add(1)
+		go func(n string) {
+			defer cacheWg.Done()
+			// Pre-fetch node data to populate cache
+			_, _ = em.ocClient.GetNodeData(n)
+		}(node)
+	}
+	cacheWg.Wait()
 
 	// Track number of lines we've printed (for overwriting)
 	linesPrinted := 0
@@ -2914,7 +3067,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 	iterationCount := 0
 	for {
 		iterationCount++
-		timestamp := time.Now().Format(time.RFC3339)
+		em.perfMonitor.iterations = iterationCount
+		// Cache timestamp to avoid multiple time.Now() calls in this iteration
+		now := time.Now()
+		timestamp := now.Format(time.RFC3339)
 
 		// Fetch EIP and CPIC data once per iteration (reduces API calls)
 		eipData, cpicData, err := em.ocClient.FetchEIPAndCPICData()
@@ -2922,38 +3078,85 @@ func (em *EIPMonitor) MonitorLoop() error {
 			return err
 		}
 
-		// Compute stats from pre-fetched data
-		eipStats, err := em.ocClient.GetEIPStatsFromData(eipData)
-		if err != nil {
-			return err
+		// Compute stats from pre-fetched data in parallel
+		var eipStats *EIPStats
+		var cpicStats *CPICStats
+		var eipErr, cpicErr error
+
+		var statsWg sync.WaitGroup
+		statsWg.Add(2)
+
+		go func() {
+			defer statsWg.Done()
+			eipStats, eipErr = em.ocClient.GetEIPStatsFromData(eipData)
+		}()
+
+		go func() {
+			defer statsWg.Done()
+			cpicStats, cpicErr = em.ocClient.GetCPICStatsFromData(cpicData)
+		}()
+
+		statsWg.Wait()
+
+		if eipErr != nil {
+			return eipErr
+		}
+		if cpicErr != nil {
+			return cpicErr
 		}
 
-		cpicStats, err := em.ocClient.GetCPICStatsFromData(cpicData)
-		if err != nil {
-			return err
+		// Get CNCC stats (cached, as they change infrequently)
+		cnccStats := &CNCCStats{}
+		em.cnccCacheMutex.RLock()
+		cacheValid := !em.cnccCacheTime.IsZero() && time.Since(em.cnccCacheTime) < 30*time.Second
+		if cacheValid && em.cnccCache != nil {
+			cnccStats = em.cnccCache
+			em.cnccCacheMutex.RUnlock()
+		} else {
+			em.cnccCacheMutex.RUnlock()
+			// Fetch fresh CNCC stats
+			stats, err := em.ocClient.GetCNCCStats()
+			if err != nil {
+				// Log error but don't fail - CNCC stats are optional
+				fmt.Fprintf(os.Stderr, "Warning: Failed to get CNCC stats: %v\n", err)
+			} else {
+				cnccStats = stats
+				// Update cache
+				em.cnccCacheMutex.Lock()
+				em.cnccCache = stats
+				em.cnccCacheTime = time.Now()
+				em.cnccCacheMutex.Unlock()
+			}
 		}
 
-		// Get CNCC stats (pod health and queue depth)
-		cnccStats, err := em.ocClient.GetCNCCStats()
-		if err != nil {
-			// Log error but don't fail - CNCC stats are optional
-			fmt.Fprintf(os.Stderr, "Warning: Failed to get CNCC stats: %v\n", err)
-			cnccStats = &CNCCStats{} // Use empty stats
-		}
+		// Get malfunctioning and overcommitted counts in parallel (using pre-fetched data)
+		var malfunctioningEIPs, overcommittedEIPs int
+		var malfunctionErr, overcommittedErr error
 
-		// Get malfunctioning EIP objects count (using pre-fetched data)
-		malfunctioningEIPs, err := em.ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
-		if err != nil {
+		var countWg sync.WaitGroup
+		countWg.Add(2)
+
+		go func() {
+			defer countWg.Done()
+			malfunctioningEIPs, malfunctionErr = em.ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
+		}()
+
+		go func() {
+			defer countWg.Done()
+			overcommittedEIPs, overcommittedErr = em.ocClient.CountOvercommittedEIPObjects(eipData)
+		}()
+
+		countWg.Wait()
+
+		if malfunctionErr != nil {
 			// Log error but don't fail - malfunctioning count is optional
-			fmt.Fprintf(os.Stderr, "Warning: Failed to count malfunctioning EIP objects: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Warning: Failed to count malfunctioning EIP objects: %v\n", malfunctionErr)
 			malfunctioningEIPs = 0
 		}
 
-		// Get overcommitted EIP objects count (using pre-fetched data)
-		overcommittedEIPs, err := em.ocClient.CountOvercommittedEIPObjects(eipData)
-		if err != nil {
+		if overcommittedErr != nil {
 			// Log error but don't fail - overcommitted count is optional
-			fmt.Fprintf(os.Stderr, "Warning: Failed to count overcommitted EIP objects: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Warning: Failed to count overcommitted EIP objects: %v\n", overcommittedErr)
 			overcommittedEIPs = 0
 		}
 
@@ -2998,8 +3201,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 			fmt.Printf("\033[%dA", prevLinesPrinted) // Move up N lines to get back to first line
 		}
 
-		// Print timestamp for this iteration
-		timestampStr := time.Now().Format("2006/01/02 15:04:05")
+		// Print timestamp for this iteration (reuse cached now)
+		timestampStr := now.Format("2006/01/02 15:04:05")
 		clearLine := ""
 		if isTerminal {
 			clearLine = "\033[K"
@@ -3142,26 +3345,35 @@ func (em *EIPMonitor) MonitorLoop() error {
 			*prevValues[data.Node] = *data
 		}
 
-		// Calculate total cluster capacity from subnet CIDR
-		// Get subnet from first node's annotation (assuming all nodes share same subnet)
-		clusterCapacity := 0
-		if len(nodeData) > 0 {
-			firstNode := nodeData[0].Node
-			nodeDataRaw, err := em.ocClient.RunCommand([]string{"get", "node", firstNode, "-o", "json"})
-			if err == nil {
-				if metadata, ok := nodeDataRaw["metadata"].(map[string]interface{}); ok {
-					annotations, ok := metadata["annotations"].(map[string]interface{})
-					if ok {
-						egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
-						if ok && egressIPConfig != "" {
-							var configs []map[string]interface{}
-							if err := json.Unmarshal([]byte(egressIPConfig), &configs); err == nil {
-								for _, config := range configs {
-									if ifaddr, ok := config["ifaddr"].(map[string]interface{}); ok {
-										if ipv4, ok := ifaddr["ipv4"].(string); ok {
-											// Parse CIDR (e.g., "10.0.2.0/23")
-											clusterCapacity = calculateSubnetSize(ipv4)
-											break // Use first interface's subnet
+		// Calculate total cluster capacity from subnet CIDR (cached, as it rarely changes)
+		var clusterCapacity int
+		em.clusterCapacityCacheMutex.RLock()
+		clusterCapacityCacheValid := !em.clusterCapacityCacheTime.IsZero() && time.Since(em.clusterCapacityCacheTime) < 5*time.Minute
+		if clusterCapacityCacheValid {
+			clusterCapacity = em.clusterCapacityCache
+			em.clusterCapacityCacheMutex.RUnlock()
+		} else {
+			em.clusterCapacityCacheMutex.RUnlock()
+			// Calculate from first node's annotation (assuming all nodes share same subnet)
+			clusterCapacity = 0
+			if len(nodeData) > 0 {
+				firstNode := nodeData[0].Node
+				nodeDataRaw, err := em.ocClient.RunCommand([]string{"get", "node", firstNode, "-o", "json"})
+				if err == nil {
+					if metadata, ok := nodeDataRaw["metadata"].(map[string]interface{}); ok {
+						annotations, ok := metadata["annotations"].(map[string]interface{})
+						if ok {
+							egressIPConfig, ok := annotations["cloud.network.openshift.io/egress-ipconfig"].(string)
+							if ok && egressIPConfig != "" {
+								var configs []map[string]interface{}
+								if err := json.Unmarshal([]byte(egressIPConfig), &configs); err == nil {
+									for _, config := range configs {
+										if ifaddr, ok := config["ifaddr"].(map[string]interface{}); ok {
+											if ipv4, ok := ifaddr["ipv4"].(string); ok {
+												// Parse CIDR (e.g., "10.0.2.0/23")
+												clusterCapacity = calculateSubnetSize(ipv4)
+												break // Use first interface's subnet
+											}
 										}
 									}
 								}
@@ -3170,6 +3382,11 @@ func (em *EIPMonitor) MonitorLoop() error {
 					}
 				}
 			}
+			// Update cache
+			em.clusterCapacityCacheMutex.Lock()
+			em.clusterCapacityCache = clusterCapacity
+			em.clusterCapacityCacheTime = time.Now()
+			em.clusterCapacityCacheMutex.Unlock()
 		}
 
 		// Calculate assigned EIPs by summing per-node counts (to ensure consistency)
@@ -3514,7 +3731,109 @@ func (em *EIPMonitor) MonitorLoop() error {
 	}
 
 	log.Println("Monitoring complete - all EIPs assigned, CPIC issues resolved, and Azure EIPs match expected state")
+	// Performance stats will be displayed by defer function
+	// Note: defer will run after this return, so stats will be shown
 	return nil
+}
+
+// displayPerformanceStats displays and logs performance metrics
+func (em *EIPMonitor) displayPerformanceStats() {
+	log.Println("displayPerformanceStats called")
+	// Check if monitoring was actually started
+	if em.perfMonitor.startTime.IsZero() {
+		log.Printf("Warning: Performance monitoring was not started (startTime is zero)")
+		fmt.Fprintf(os.Stdout, "\n⚠️  Performance monitoring was not started\n")
+		return
+	}
+
+	duration := em.perfMonitor.GetDuration()
+	peakHeapAlloc, currentHeapAlloc, heapSys, numGC := em.perfMonitor.GetMemoryStats()
+
+	// Get current memory stats for display
+	var currentMemStats runtime.MemStats
+	runtime.ReadMemStats(&currentMemStats)
+
+	// Display performance stats - ensure it goes to stdout
+	fmt.Fprintf(os.Stdout, "\n")
+	fmt.Fprintf(os.Stdout, "═══════════════════════════════════════════════════════════════\n")
+	fmt.Fprintf(os.Stdout, "Performance Statistics\n")
+	fmt.Fprintf(os.Stdout, "═══════════════════════════════════════════════════════════════\n")
+	fmt.Fprintf(os.Stdout, "Runtime Duration:     %s\n", duration.Round(time.Second))
+	fmt.Fprintf(os.Stdout, "Total Iterations:     %d\n", em.perfMonitor.iterations)
+	if em.perfMonitor.iterations > 0 {
+		avgIterationTime := duration / time.Duration(em.perfMonitor.iterations)
+		fmt.Fprintf(os.Stdout, "Avg Iteration Time:   %s\n", avgIterationTime.Round(time.Millisecond))
+	}
+	fmt.Fprintf(os.Stdout, "\n")
+	fmt.Fprintf(os.Stdout, "Memory Usage:\n")
+	fmt.Fprintf(os.Stdout, "  Current Heap Alloc: %s\n", formatBytes(currentHeapAlloc))
+	fmt.Fprintf(os.Stdout, "  Peak Heap Alloc:    %s\n", formatBytes(peakHeapAlloc))
+	fmt.Fprintf(os.Stdout, "  Heap System:        %s\n", formatBytes(heapSys))
+	fmt.Fprintf(os.Stdout, "  GC Collections:     %d\n", numGC)
+	fmt.Fprintf(os.Stdout, "  Alloc Objects:      %d\n", currentMemStats.Mallocs)
+	fmt.Fprintf(os.Stdout, "  Free Objects:       %d\n", currentMemStats.Frees)
+	fmt.Fprintf(os.Stdout, "\n")
+	fmt.Fprintf(os.Stdout, "System Memory:\n")
+	fmt.Fprintf(os.Stdout, "  Total Alloc:        %s\n", formatBytes(currentMemStats.TotalAlloc))
+	fmt.Fprintf(os.Stdout, "  Sys (from OS):      %s\n", formatBytes(currentMemStats.Sys))
+	fmt.Fprintf(os.Stdout, "  Num Goroutines:     %d\n", runtime.NumGoroutine())
+	fmt.Fprintf(os.Stdout, "═══════════════════════════════════════════════════════════════\n")
+
+	// Log performance stats to file
+	// Try logsDir first, fall back to current directory if logsDir doesn't exist or is empty
+	perfLogFile := "performance_stats.log" // Default to current directory
+	if em.logsDir != "" {
+		// Try to use logsDir
+		if _, err := os.Stat(em.logsDir); err == nil {
+			// Directory exists, use it
+			perfLogFile = filepath.Join(em.logsDir, "performance_stats.log")
+		} else {
+			// Directory doesn't exist, use current directory (already set above)
+			log.Printf("Warning: logsDir '%s' does not exist, saving performance stats to current directory", em.logsDir)
+		}
+	}
+
+	// Write performance stats to file if possible
+	f, err := os.OpenFile(perfLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Warning: Failed to log performance stats to %s: %v", perfLogFile, err)
+		fmt.Fprintf(os.Stdout, "\n⚠️  Performance stats file write failed: %s\n", perfLogFile)
+		fmt.Fprintf(os.Stdout, "   Error: %v\n", err)
+		fmt.Fprintf(os.Stdout, "   Stats displayed above are still valid.\n")
+	} else {
+		defer f.Close()
+
+		// Write performance stats in a structured format
+		fmt.Fprintf(f, "═══════════════════════════════════════════════════════════════\n")
+		fmt.Fprintf(f, "Performance Statistics - %s\n", time.Now().Format(time.RFC3339))
+		fmt.Fprintf(f, "═══════════════════════════════════════════════════════════════\n")
+		fmt.Fprintf(f, "Runtime Duration:     %s\n", duration.Round(time.Second))
+		fmt.Fprintf(f, "Total Iterations:     %d\n", em.perfMonitor.iterations)
+		if em.perfMonitor.iterations > 0 {
+			avgIterationTime := duration / time.Duration(em.perfMonitor.iterations)
+			fmt.Fprintf(f, "Avg Iteration Time:   %s\n", avgIterationTime.Round(time.Millisecond))
+		}
+		fmt.Fprintf(f, "\n")
+		fmt.Fprintf(f, "Memory Usage:\n")
+		fmt.Fprintf(f, "  Current Heap Alloc: %s (%d bytes)\n", formatBytes(currentHeapAlloc), currentHeapAlloc)
+		fmt.Fprintf(f, "  Peak Heap Alloc:    %s (%d bytes)\n", formatBytes(peakHeapAlloc), peakHeapAlloc)
+		fmt.Fprintf(f, "  Heap System:        %s (%d bytes)\n", formatBytes(heapSys), heapSys)
+		fmt.Fprintf(f, "  GC Collections:     %d\n", numGC)
+		fmt.Fprintf(f, "  Alloc Objects:      %d\n", currentMemStats.Mallocs)
+		fmt.Fprintf(f, "  Free Objects:       %d\n", currentMemStats.Frees)
+		fmt.Fprintf(f, "\n")
+		fmt.Fprintf(f, "System Memory:\n")
+		fmt.Fprintf(f, "  Total Alloc:        %s (%d bytes)\n", formatBytes(currentMemStats.TotalAlloc), currentMemStats.TotalAlloc)
+		fmt.Fprintf(f, "  Sys (from OS):      %s (%d bytes)\n", formatBytes(currentMemStats.Sys), currentMemStats.Sys)
+		fmt.Fprintf(f, "  Num Goroutines:     %d\n", runtime.NumGoroutine())
+		fmt.Fprintf(f, "═══════════════════════════════════════════════════════════════\n\n")
+		log.Printf("Performance stats saved to: %s", perfLogFile)
+		fmt.Fprintf(os.Stdout, "\n✅ Performance stats saved to: %s\n", perfLogFile)
+	}
+
+	// Ensure output is flushed
+	os.Stdout.Sync()
+	os.Stderr.Sync()
 }
 
 // formatValue formats a value with highlighting if it changed
@@ -5095,8 +5414,32 @@ func cmdAll() error {
 		}
 
 		if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs) {
-			// Print current state once, then exit without creating directories
+			// Monitoring not needed, but still create monitor and run one iteration to show performance stats
+			// Create directories for monitoring output (even though we'll only do one iteration)
+			timestamp := time.Now().Format("060102_150405")
+			var outputDir string
+			if outputDirVar != "" {
+				outputDir = filepath.Join(outputDirVar, timestamp)
+			} else {
+				tempBase := filepath.Join(os.TempDir(), "eip-toolkit")
+				if err := os.MkdirAll(tempBase, 0755); err != nil {
+					return fmt.Errorf("failed to create temp base directory: %w", err)
+				}
+				outputDir = filepath.Join(tempBase, timestamp)
+			}
+
+			monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
+			if err != nil {
+				return err
+			}
+
+			log.Printf("Output directory: %s", outputDir)
+			// Print current state
 			if err := PrintCurrentState(); err != nil {
+				return err
+			}
+			// Run MonitorLoop which will do one iteration and show performance stats
+			if err := monitor.MonitorLoop(); err != nil {
 				return err
 			}
 			log.Println("No monitoring needed - pipeline complete")
