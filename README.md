@@ -20,10 +20,35 @@ curl -L -o eip-toolkit https://github.com/CSA-RH/aro-eip-toolkit/releases/downlo
 chmod +x eip-toolkit
 ```
 
+**Windows (x86_64):**
+```powershell
+# Using PowerShell
+Invoke-WebRequest -Uri "https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.2.0/eip-toolkit-windows-amd64.exe" -OutFile "eip-toolkit.exe"
+```
+
+Or using curl (if available):
+```cmd
+curl -L -o eip-toolkit.exe https://github.com/CSA-RH/aro-eip-toolkit/releases/download/v0.2.0/eip-toolkit-windows-amd64.exe
+```
+
 Then set environment variables:
+
+**Linux/macOS:**
 ```bash
 export AZ_SUBSCRIPTION="your-subscription-id"
 export AZ_RESOURCE_GROUP="your-resource-group"
+```
+
+**Windows (PowerShell):**
+```powershell
+$env:AZ_SUBSCRIPTION="your-subscription-id"
+$env:AZ_RESOURCE_GROUP="your-resource-group"
+```
+
+**Windows (CMD):**
+```cmd
+set AZ_SUBSCRIPTION=your-subscription-id
+set AZ_RESOURCE_GROUP=your-resource-group
 ```
 
 ### Building from Source
@@ -41,18 +66,20 @@ make build-darwin-amd64    # Intel Mac
 make build-darwin-arm64    # Apple Silicon
 make build-linux-amd64     # Linux x86_64
 make build-linux-arm64     # Linux ARM64
+make build-windows-amd64   # Windows x86_64
+make build-windows-arm64   # Windows ARM64
+
+# Or manually for Windows:
+GOOS=windows GOARCH=amd64 go build -o eip-toolkit.exe eip_toolkit.go
 ```
 
-Set environment variables:
-```bash
-export AZ_SUBSCRIPTION="your-subscription-id"
-export AZ_RESOURCE_GROUP="your-resource-group"
-```
+Set environment variables (see Installation section above for platform-specific syntax).
 
 ## Usage
 
 ### Commands
 
+**Linux/macOS:**
 ```bash
 # Monitor EIP and CPIC status
 ./eip-toolkit monitor
@@ -83,11 +110,75 @@ export AZ_RESOURCE_GROUP="your-resource-group"
 ./eip-toolkit all-optimized
 ```
 
+**Windows:**
+```powershell
+# Monitor EIP and CPIC status
+.\eip-toolkit.exe monitor
+
+# Monitor with custom output directory
+.\eip-toolkit.exe monitor --output-dir C:\path\to\output
+.\eip-toolkit.exe monitor -o C:\path\to\output
+
+# Process log files into structured data
+.\eip-toolkit.exe merge <directory>
+
+# Generate plots from data files
+.\eip-toolkit.exe plot <directory>
+
+# Complete pipeline: monitor → merge → plot
+.\eip-toolkit.exe all
+
+# Complete pipeline with custom output directory
+.\eip-toolkit.exe all --output-dir C:\path\to\output
+
+# Async monitoring (parallel processing via goroutines)
+.\eip-toolkit.exe monitor-async
+
+# Optimized merge
+.\eip-toolkit.exe merge-optimized <directory>
+
+# Optimized pipeline
+.\eip-toolkit.exe all-optimized
+```
+
 **Early Exit Behavior:**
 - If all EIPs are already properly configured, the tool will:
   - Print the current state once
   - Exit without creating directories, logs, or graphs
   - This allows quick status checks without generating files
+
+### Shell Completion
+
+The toolkit supports shell completion for improved usability:
+
+**Bash/Zsh (Linux/macOS):**
+```bash
+# For current session
+source <(eip-toolkit completion bash)  # for bash
+source <(eip-toolkit completion zsh)   # for zsh
+
+# For permanent installation (bash)
+eip-toolkit completion bash > $(brew --prefix)/etc/bash_completion.d/eip-toolkit  # macOS
+# or
+eip-toolkit completion bash > /etc/bash_completion.d/eip-toolkit  # Linux
+
+# For permanent installation (zsh)
+eip-toolkit completion zsh > "${fpath[1]}/_eip-toolkit"
+```
+
+**PowerShell (Windows):**
+```powershell
+# Generate completion script
+.\eip-toolkit.exe completion powershell | Out-String | Invoke-Expression
+
+# For permanent installation, add to your PowerShell profile:
+.\eip-toolkit.exe completion powershell >> $PROFILE
+```
+
+**Fish:**
+```bash
+eip-toolkit completion fish > ~/.config/fish/completions/eip-toolkit.fish
+```
 
 ### Output Structure
 
@@ -369,12 +460,19 @@ All logged metrics are automatically plotted. The following metrics are logged t
 - Overcommitment detection for EIP resources with more IPs than available nodes
 - Early exit with state display when no monitoring needed
 - Optimized API calls: EIP and CPIC data fetched once per iteration and reused for all nodes
-- Cross-platform support (Linux x86_64/ARM64, macOS Intel/Apple Silicon)
+- Cross-platform support (Linux x86_64/ARM64, macOS Intel/Apple Silicon, Windows x86_64/ARM64)
 
 ### Platform Support
 
 The toolkit builds and runs on:
 - **macOS**: Intel (x86_64) and Apple Silicon (ARM64)
 - **Linux**: x86_64 and ARM64
+- **Windows**: x86_64 and ARM64
 
 All dependencies are pure Go with no CGO requirements, ensuring consistent behavior across platforms. External dependencies (`oc` and `az` CLI tools) must be installed separately for the target platform.
+
+**Windows Notes:**
+- Requires Windows 10/11 or Windows Server 2016+
+- PowerShell completion is supported natively
+- Works best with Windows Terminal or modern PowerShell (for ANSI color support)
+- Ensure `oc` and `az` CLI tools are installed and available in PATH

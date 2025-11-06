@@ -1,4 +1,4 @@
-.PHONY: build build-main build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 clean
+.PHONY: build build-main build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64 build-windows-amd64 build-windows-arm64 clean
 
 build: build-main
 
@@ -17,6 +17,12 @@ build-darwin-amd64:
 
 build-darwin-arm64:
 	GOOS=darwin GOARCH=arm64 go build -o eip-toolkit-darwin-arm64 eip_toolkit.go
+
+build-windows-amd64:
+	GOOS=windows GOARCH=amd64 go build -o eip-toolkit-windows-amd64.exe eip_toolkit.go
+
+build-windows-arm64:
+	GOOS=windows GOARCH=arm64 go build -o eip-toolkit-windows-arm64.exe eip_toolkit.go
 
 clean:
 	rm -f eip-toolkit eip-toolkit-*
