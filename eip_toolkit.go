@@ -5596,7 +5596,48 @@ func main() {
 	}
 	allOptimizedCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
 
-	rootCmd.AddCommand(monitorCmd, mergeCmd, plotCmd, allCmd, monitorAsyncCmd, mergeOptimizedCmd, allOptimizedCmd)
+	// Add completion command
+	var completionCmd = &cobra.Command{
+		Use:   "completion [bash|zsh|fish|powershell]",
+		Short: "Generate shell completion script",
+		Long: `Generate shell completion script for eip-toolkit.
+
+To load completions in your current shell session:
+  source <(eip-toolkit completion bash)  # for bash
+  source <(eip-toolkit completion zsh)   # for zsh
+
+To load completions for all new shells, add the completion script to your shell's completion directory:
+  # For bash (Linux)
+  eip-toolkit completion bash > /etc/bash_completion.d/eip-toolkit
+
+  # For bash (macOS with Homebrew)
+  eip-toolkit completion bash > $(brew --prefix)/etc/bash_completion.d/eip-toolkit
+
+  # For zsh
+  eip-toolkit completion zsh > "${fpath[1]}/_eip-toolkit"
+
+  # For fish
+  eip-toolkit completion fish > ~/.config/fish/completions/eip-toolkit.fish
+`,
+		ValidArgs: []string{"bash", "zsh", "fish", "powershell"},
+		Args:      cobra.ExactValidArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			switch args[0] {
+			case "bash":
+				return rootCmd.GenBashCompletion(os.Stdout)
+			case "zsh":
+				return rootCmd.GenZshCompletion(os.Stdout)
+			case "fish":
+				return rootCmd.GenFishCompletion(os.Stdout, true)
+			case "powershell":
+				return rootCmd.GenPowerShellCompletion(os.Stdout)
+			default:
+				return fmt.Errorf("unsupported shell: %s", args[0])
+			}
+		},
+	}
+
+	rootCmd.AddCommand(monitorCmd, mergeCmd, plotCmd, allCmd, monitorAsyncCmd, mergeOptimizedCmd, allOptimizedCmd, completionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
 		if _, ok := err.(*EIPToolkitError); ok {
