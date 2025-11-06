@@ -3213,6 +3213,9 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 
 func (em *EIPMonitor) MonitorLoop() error {
 	log.Println("Starting EIP monitoring loop...")
+	if em.infiniteLoop {
+		log.Println("Infinite loop mode enabled - monitoring will continue indefinitely")
+	}
 
 	// Start performance monitoring only if enabled
 	if em.perfMonitor != nil {
@@ -3895,7 +3898,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// Always do at least one iteration to show current state
 		// After first iteration, check if monitoring should continue
 		// Skip this check if infinite loop mode is enabled
-		if !em.infiniteLoop {
+		if em.infiniteLoop {
+			// Infinite loop mode: continue indefinitely
+			// No need to check ShouldContinueMonitoring
+		} else {
 			shouldContinue := em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs)
 			if iterationCount == 1 && !shouldContinue {
 				// First iteration shows state, but we don't need to continue - exit immediately
@@ -5472,46 +5478,49 @@ func cmdMonitor() error {
 
 	// Check if monitoring is needed BEFORE creating directories
 	// Note: ocClient already created and verified above
-	eipStats, err := ocClient.GetEIPStats()
-	if err != nil {
-		return err
-	}
-
-	cpicStats, err := ocClient.GetCPICStats()
-	if err != nil {
-		return err
-	}
-
-	// Create a temporary monitor just for the check (no perf monitoring needed for check)
-	tempMonitor := &EIPMonitor{ocClient: ocClient, perfMonitor: nil}
-	// Get overcommitted count for the check
-	overcommittedEIPs, err := ocClient.CountOvercommittedEIPObjects()
-	if err != nil {
-		overcommittedEIPs = 0 // Default to 0 if we can't determine
-	}
-
-	// Get Azure resources for the check
-	// We need to get node data to calculate total Azure resources
-	nodes, err := ocClient.GetEIPEnabledNodes()
-	if err != nil {
-		// If we can't get nodes, continue monitoring
-	} else {
-		azClient := NewAzureClient(subscriptionID, resourceGroup)
-		totalAzureEIPs := 0
-		totalAzureLBs := 0
-		for _, node := range nodes {
-			azureEIPs, azureLBs, _ := azClient.GetNodeNICStats(node)
-			totalAzureEIPs += azureEIPs
-			totalAzureLBs += azureLBs
+	// Skip this check if infinite loop mode is enabled
+	if !infiniteLoopFlag {
+		eipStats, err := ocClient.GetEIPStats()
+		if err != nil {
+			return err
 		}
 
-		if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs) {
-			// Print current state once, then exit without creating directories
-			if err := PrintCurrentState(); err != nil {
-				return err
+		cpicStats, err := ocClient.GetCPICStats()
+		if err != nil {
+			return err
+		}
+
+		// Create a temporary monitor just for the check (no perf monitoring needed for check)
+		tempMonitor := &EIPMonitor{ocClient: ocClient, perfMonitor: nil}
+		// Get overcommitted count for the check
+		overcommittedEIPs, err := ocClient.CountOvercommittedEIPObjects()
+		if err != nil {
+			overcommittedEIPs = 0 // Default to 0 if we can't determine
+		}
+
+		// Get Azure resources for the check
+		// We need to get node data to calculate total Azure resources
+		nodes, err := ocClient.GetEIPEnabledNodes()
+		if err != nil {
+			// If we can't get nodes, continue monitoring
+		} else {
+			azClient := NewAzureClient(subscriptionID, resourceGroup)
+			totalAzureEIPs := 0
+			totalAzureLBs := 0
+			for _, node := range nodes {
+				azureEIPs, azureLBs, _ := azClient.GetNodeNICStats(node)
+				totalAzureEIPs += azureEIPs
+				totalAzureLBs += azureLBs
 			}
-			log.Println("No monitoring needed - all EIPs properly configured and Azure EIPs match expected state")
-			return nil
+
+			if !tempMonitor.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs) {
+				// Print current state once, then exit without creating directories
+				if err := PrintCurrentState(); err != nil {
+					return err
+				}
+				log.Println("No monitoring needed - all EIPs properly configured and Azure EIPs match expected state")
+				return nil
+			}
 		}
 	}
 
