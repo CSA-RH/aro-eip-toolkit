@@ -22,6 +22,7 @@ import (
 	"gonum.org/v1/plot"
 	"gonum.org/v1/plot/plotter"
 	"gonum.org/v1/plot/vg"
+	"gonum.org/v1/plot/vg/draw"
 )
 
 // EIPToolkitError represents toolkit-specific errors
@@ -4605,14 +4606,14 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 	p.Y.Label.Text = "Value"
 	p.X.Tick.Marker = plot.TimeTicks{Format: "15:04:05"}
 
-	// Configure legend to be centered below the plot
-	p.Legend.Top = false // Place legend below the plot (under time axis)
-	// To center: Left=false means right-aligned, then we offset left by half the plot width
-	// For a 10 inch plot, approximate center is around -250 points from right edge
-	p.Legend.Left = false                       // Right-align first
-	p.Legend.XOffs = vg.Points(-250)            // Offset left to center (approximate for 10" plot)
-	p.Legend.YOffs = vg.Points(-50)             // Position below the "Time" label and timestamps
-	p.Legend.TextStyle.Font.Size = vg.Points(9) // Smaller font to fit more entries
+	// Configure legend - position inside plot area at top-right for better readability
+	p.Legend.Top = true   // Place at top
+	p.Legend.Left = false // Right-align the legend box
+	// Position legend inside the plot area (negative offsets move into plot area)
+	p.Legend.XOffs = vg.Points(-10)             // Small offset from right edge, inside plot
+	p.Legend.YOffs = vg.Points(-10)             // Small offset from top edge, inside plot
+	p.Legend.TextStyle.Font.Size = vg.Points(9) // Readable font size
+	p.Legend.Padding = vg.Points(8)             // Padding inside legend frame
 
 	// Color palette for different nodes - using distinguishable, accessible colors
 	// Colors chosen for good contrast and color-blind accessibility
@@ -4992,8 +4993,19 @@ func (pg *PlotGenerator) generatePlot(dataFile, plotPath, title string) error {
 		colorIdx++
 	}
 
-	// Save plot with extra height to accommodate legend at bottom and event labels at top
-	if err := p.Save(10*vg.Inch, 7*vg.Inch, plotPath); err != nil {
+	// Add background box behind legend for readability when it overlaps graph lines
+	legendBg := &legendBackground{
+		xOffs:  p.Legend.XOffs,
+		yOffs:  p.Legend.YOffs,
+		width:  vg.Points(280), // Width to contain legend text
+		height: vg.Points(120), // Height to cover legend entries
+		top:    p.Legend.Top,
+		left:   p.Legend.Left,
+	}
+	p.Add(legendBg)
+
+	// Save plot with standard dimensions
+	if err := p.Save(15*vg.Inch, 7*vg.Inch, plotPath); err != nil {
 		return err
 	}
 
@@ -5144,22 +5156,148 @@ func (pg *PlotGenerator) GenerateDashboardPlot() error {
 	p.X.Label.Text = "Time"
 	p.X.Tick.Marker = plot.TimeTicks{Format: "15:04:05"}
 	p.Y.Label.Text = "Count"
-	// Configure legend to be centered below the plot
-	p.Legend.Top = false // Place legend below the plot (under time axis)
-	// To center: Left=false means right-aligned, then we offset left by half the plot width
-	// For a 10 inch plot, approximate center is around -250 points from right edge
-	p.Legend.Left = false                       // Right-align first
-	p.Legend.XOffs = vg.Points(-250)            // Offset left to center (approximate for 10" plot)
-	p.Legend.YOffs = vg.Points(-50)             // Position below the "Time" label and timestamps
-	p.Legend.TextStyle.Font.Size = vg.Points(9) // Smaller font to fit more entries
 
-	// Save large dashboard plot with extra height to accommodate legend at bottom
+	// Configure legend - position inside plot area at top-right for better readability
+	p.Legend.Top = true   // Place at top
+	p.Legend.Left = false // Right-align the legend box
+	// Position legend inside the plot area (negative offsets move into plot area)
+	p.Legend.XOffs = vg.Points(-10)             // Small offset from right edge, inside plot
+	p.Legend.YOffs = vg.Points(-10)             // Small offset from top edge, inside plot
+	p.Legend.TextStyle.Font.Size = vg.Points(9) // Readable font size
+	p.Legend.Padding = vg.Points(8)             // Padding inside legend frame
+
+	// Add background box behind legend for readability when it overlaps graph lines
+	legendBg := &legendBackground{
+		xOffs:  p.Legend.XOffs,
+		yOffs:  p.Legend.YOffs,
+		width:  vg.Points(350), // Wider for dashboard with more entries
+		height: vg.Points(200), // Taller for dashboard with more entries
+		top:    p.Legend.Top,
+		left:   p.Legend.Left,
+	}
+	p.Add(legendBg)
+
+	// Save large dashboard plot with standard dimensions
 	dashboardPath := filepath.Join(pg.plotsDir, "dashboard.png")
-	if err := p.Save(20*vg.Inch, 13*vg.Inch, dashboardPath); err != nil {
+	if err := p.Save(26*vg.Inch, 13*vg.Inch, dashboardPath); err != nil {
 		return err
 	}
 
 	return nil
+}
+
+// legendBackground is a custom plotter that draws a rectangle behind the legend
+type legendBackground struct {
+	xOffs, yOffs  vg.Length
+	width, height vg.Length
+	top, left     bool
+}
+
+// Plot implements the plotter.Plotter interface
+func (lb *legendBackground) Plot(c draw.Canvas, plt *plot.Plot) {
+	// Get plot data area in canvas coordinates
+	// plt.X.Norm() normalizes data values to 0-1 range within the plot area
+	// c.X() and c.Y() convert normalized coordinates to canvas coordinates
+	xMinNorm := plt.X.Norm(plt.X.Min) // Should be 0
+	xMaxNorm := plt.X.Norm(plt.X.Max) // Should be 1
+	yMinNorm := plt.Y.Norm(plt.Y.Min) // Should be 0
+	yMaxNorm := plt.Y.Norm(plt.Y.Max) // Should be 1
+
+	plotAreaMinX := c.X(xMinNorm)
+	plotAreaMaxX := c.X(xMaxNorm)
+	plotAreaMinY := c.Y(yMinNorm)
+	plotAreaMaxY := c.Y(yMaxNorm)
+
+	// Verify we have valid plot area (plotAreaMaxX should be > plotAreaMinX)
+	if plotAreaMaxX <= plotAreaMinX || plotAreaMaxY <= plotAreaMinY {
+		// Invalid plot area, skip drawing
+		return
+	}
+
+	var x, y vg.Length
+
+	if lb.left {
+		// Left: position to the left of plot area
+		x = plotAreaMinX - lb.width - lb.xOffs
+	} else {
+		// Right: When Left=false, the legend is positioned at the right edge.
+		// Use the plot area's right edge (plotAreaMaxX) plus the offset.
+		// Since xOffs is negative (-10), this positions it slightly inside the right edge.
+		legendRefX := plotAreaMaxX + lb.xOffs
+		// Position box so its right edge aligns with legend reference point
+		// Box extends leftward by its width
+		x = legendRefX - lb.width
+
+		// Safety check: if x ends up on the left side, something is wrong with plotAreaMaxX
+		// In that case, calculate from canvas width instead
+		canvasWidth := c.Size().X
+		if x < canvasWidth/2 {
+			// plotAreaMaxX might be wrong, use canvas width as fallback
+			legendRefX = canvasWidth + lb.xOffs
+			x = legendRefX - lb.width
+		}
+	}
+
+	if lb.top {
+		// Top: When Top=true, the legend is positioned at the top of the plot data area.
+		// plotAreaMaxY appears to be unreliable (often the canvas top, not data area top).
+		// ALWAYS calculate from canvas height with margin to ensure correct positioning.
+		canvasHeight := c.Size().Y
+
+		// Calculate from canvas top, accounting for:
+		// - Title height: font size 16 + padding ~20 = ~36 points
+		// - Top margin/padding: ~20-30 points
+		// - Data area start: ~30-40 points
+		// Total: ~100-120 points from canvas top to get to data area top
+		// Use 120 points to be safe and ensure we're in the data area
+		topMargin := vg.Points(120) // Large margin to get into data area below title
+
+		// Legend reference point: canvasHeight - topMargin + yOffs
+		// yOffs is negative (-10), so this moves it slightly down from data area top
+		legendRefY := canvasHeight - topMargin + lb.yOffs
+
+		// Position box so its top edge aligns with the legend's top edge
+		// Box extends downward from there
+		y = legendRefY
+	} else {
+		// Bottom: When Top=false, YOffs is offset from BOTTOM of plot area
+		axisLabelHeight := vg.Points(25)
+		legendTextStartY := plotAreaMinY + lb.yOffs - axisLabelHeight
+		y = legendTextStartY
+	}
+
+	// Create rectangle corners
+	minPt := vg.Point{X: x, Y: y}
+	maxPt := vg.Point{X: x + lb.width, Y: y + lb.height}
+
+	// Draw filled rectangle with light grey background using polygon
+	c.FillPolygon(color.RGBA{R: 240, G: 240, B: 240, A: 255}, []vg.Point{
+		minPt,
+		vg.Point{X: maxPt.X, Y: minPt.Y},
+		maxPt,
+		vg.Point{X: minPt.X, Y: maxPt.Y},
+	})
+
+	// Draw black border using lines (StrokeLines takes variadic arguments)
+	borderStyle := draw.LineStyle{Color: color.Black, Width: vg.Points(1)}
+	c.StrokeLines(borderStyle,
+		[]vg.Point{minPt, vg.Point{X: maxPt.X, Y: minPt.Y}},
+		[]vg.Point{vg.Point{X: maxPt.X, Y: minPt.Y}, maxPt},
+		[]vg.Point{maxPt, vg.Point{X: minPt.X, Y: maxPt.Y}},
+		[]vg.Point{vg.Point{X: minPt.X, Y: maxPt.Y}, minPt},
+	)
+}
+
+// DataRange implements the plotter.DataRange interface
+// Return a range that doesn't affect the plot's data range calculation
+func (lb *legendBackground) DataRange() (xmin, xmax, ymin, ymax float64) {
+	// Return zero range so this doesn't affect the plot's data bounds
+	return 0, 0, 0, 0
+}
+
+// Thumbnail implements the plotter.Thumbnailer interface (not used, but required)
+func (lb *legendBackground) Thumbnail(c *draw.Canvas) {
+	// No thumbnail needed
 }
 
 // shortenNodeName shortens long node names for legend readability
