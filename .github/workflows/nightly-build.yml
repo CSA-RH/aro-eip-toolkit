@@ -11,38 +11,44 @@ on:
 
 jobs:
   build:
-    name: Build for ${{ matrix.os }}/${{ matrix.arch }}
+    name: Build for ${{ matrix.display_os }}/${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
+            display_os: linux
             arch: amd64
             goos: linux
             goarch: amd64
             binary_name: eip-toolkit-linux-amd64
           - os: ubuntu-latest
+            display_os: linux
             arch: arm64
             goos: linux
             goarch: arm64
             binary_name: eip-toolkit-linux-arm64
           - os: macos-latest
+            display_os: macos
             arch: amd64
             goos: darwin
             goarch: amd64
             binary_name: eip-toolkit-darwin-amd64
           - os: macos-latest
+            display_os: macos
             arch: arm64
             goos: darwin
             goarch: arm64
             binary_name: eip-toolkit-darwin-arm64
           - os: windows-latest
+            display_os: windows
             arch: amd64
             goos: windows
             goarch: amd64
             binary_name: eip-toolkit-windows-amd64.exe
           - os: windows-latest
+            display_os: windows
             arch: arm64
             goos: windows
             goarch: arm64
@@ -62,14 +68,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         shell: bash
-        run: |
-          go build -o ${{ matrix.binary_name }} eip_toolkit.go
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            # Windows binaries already have .exe extension
-            echo "Binary built: ${{ matrix.binary_name }}"
-          else
-            chmod +x ${{ matrix.binary_name }}
-          fi
+        run: go build -o ${{ matrix.binary_name }} eip_toolkit.go
+
+      - name: Make binary executable (non-Windows)
+        if: matrix.goos != 'windows'
+        shell: bash
+        run: chmod +x ${{ matrix.binary_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
