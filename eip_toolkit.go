@@ -3666,7 +3666,6 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// Track if we need to display error/warning messages
 		hasErrorMessage := false
 		var mismatchCount int
-		var mismatches []EIPCPICMismatch // Store mismatches for detailed display later
 
 		// Check for EIP/CPIC mismatches only after 10 iterations without progress
 		if progressTracker.baselineSet && progressTracker.iterationsWithoutProgress >= 10 {
@@ -3696,20 +3695,6 @@ func (em *EIPMonitor) MonitorLoop() error {
 				})
 
 				if len(detectedMismatches) > 0 {
-					mismatches = detectedMismatches
-
-					// Show summary and detailed IPs (only displayed after 10 iterations without progress)
-					var parts []string
-					if nodeMismatches > 0 {
-						parts = append(parts, fmt.Sprintf("%d node mismatch(es)", nodeMismatches))
-					}
-					if missingInEIP > 0 {
-						parts = append(parts, fmt.Sprintf("%d in CPIC but not in EIP", missingInEIP))
-					}
-
-					fmt.Printf("%s\033[33;1m⚠️  EIP/CPIC Mismatch: %d IP(s) - %s\033[0m\n",
-						clearLine, len(mismatches), strings.Join(parts, ", "))
-
 					hasErrorMessage = true
 				}
 			}
@@ -3844,14 +3829,11 @@ func (em *EIPMonitor) MonitorLoop() error {
 		// If we printed fewer lines than before, clear the extra lines from previous iteration
 		// Clear if:
 		// 1. Progress was detected (iterationsWithoutProgress reset to 0), OR
-		// 2. Mismatches were actually resolved (mismatchCount went to 0), OR
-		// 3. The mismatch list size changed (even if still showing)
-		// This ensures clean output when the list changes
+		// 2. Mismatches were actually resolved (mismatchCount went to 0)
+		// Only clear when we're actually printing fewer lines (prevLinesPrinted > linesPrinted)
 		progressDetected := prevIterationsWithoutProgress >= 10 && progressTracker.iterationsWithoutProgress < 10
 		mismatchesResolved := prevMismatchCount > 0 && mismatchCount == 0
-		// Also clear if mismatch list changed size (even if still showing the list)
-		mismatchListChanged := prevLinesPrinted != linesPrinted && prevLinesPrinted > 0 && mismatchCount > 0
-		shouldClearLines := prevLinesPrinted > linesPrinted && isTerminal && (progressDetected || mismatchesResolved || mismatchListChanged)
+		shouldClearLines := prevLinesPrinted > linesPrinted && isTerminal && (progressDetected || mismatchesResolved)
 
 		if shouldClearLines {
 			// After printing new (shorter) content, we need to clear the remaining old lines
