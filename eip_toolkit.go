@@ -2666,6 +2666,7 @@ type EIPMonitor struct {
 	azClient       *AzureClient
 	bufferedLogger *BufferedLogger
 	perfMonitor    *PerformanceMonitor
+	infiniteLoop   bool
 	// Cache for node data that rarely changes
 	nodeCache                 map[string]*NodeCacheData
 	nodeCacheMutex            sync.RWMutex
@@ -2684,7 +2685,7 @@ type NodeCacheData struct {
 	LastUpdate time.Time
 }
 
-func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor, error) {
+func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string, enablePerfMon bool, infiniteLoop bool) (*EIPMonitor, error) {
 	logsDir := filepath.Join(outputDir, "logs")
 	dataDir := filepath.Join(outputDir, "data")
 	plotsDir := filepath.Join(outputDir, "plots")
@@ -2695,7 +2696,7 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor
 		}
 	}
 
-	return &EIPMonitor{
+	monitor := &EIPMonitor{
 		outputDir:      outputDir,
 		logsDir:        logsDir,
 		dataDir:        dataDir,
@@ -2703,9 +2704,16 @@ func NewEIPMonitor(outputDir, subscriptionID, resourceGroup string) (*EIPMonitor
 		ocClient:       NewOpenShiftClient(),
 		azClient:       NewAzureClient(subscriptionID, resourceGroup),
 		bufferedLogger: NewBufferedLogger(logsDir, 100),
-		perfMonitor:    &PerformanceMonitor{},
 		nodeCache:      make(map[string]*NodeCacheData),
-	}, nil
+		infiniteLoop:   infiniteLoop,
+	}
+
+	// Only initialize performance monitor if enabled
+	if enablePerfMon {
+		monitor.perfMonitor = &PerformanceMonitor{}
+	}
+
+	return monitor, nil
 }
 
 func (em *EIPMonitor) ShouldContinueMonitoring(eipStats *EIPStats, cpicStats *CPICStats, overcommittedEIPs int, totalAzureEIPs int) bool {
@@ -3002,20 +3010,22 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 func (em *EIPMonitor) MonitorLoop() error {
 	log.Println("Starting EIP monitoring loop...")
 
-	// Start performance monitoring
-	em.perfMonitor.Start()
+	// Start performance monitoring only if enabled
+	if em.perfMonitor != nil {
+		em.perfMonitor.Start()
 
-	// Ensure we stop performance monitoring even on early exit
-	defer func() {
-		// Always stop and display if monitoring was started (check if startTime is set)
-		if !em.perfMonitor.startTime.IsZero() {
-			log.Println("Stopping performance monitor and displaying stats...")
-			em.perfMonitor.Stop()
-			em.displayPerformanceStats()
-		} else {
-			log.Println("Performance monitor was not started (startTime is zero)")
-		}
-	}()
+		// Ensure we stop performance monitoring even on early exit
+		defer func() {
+			// Always stop and display if monitoring was started (check if startTime is set)
+			if !em.perfMonitor.startTime.IsZero() {
+				log.Println("Stopping performance monitor and displaying stats...")
+				em.perfMonitor.Stop()
+				em.displayPerformanceStats()
+			} else {
+				log.Println("Performance monitor was not started (startTime is zero)")
+			}
+		}()
+	}
 
 	nodes, err := em.ocClient.GetEIPEnabledNodes()
 	if err != nil {
@@ -3067,7 +3077,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 	iterationCount := 0
 	for {
 		iterationCount++
-		em.perfMonitor.iterations = iterationCount
+		if em.perfMonitor != nil {
+			em.perfMonitor.iterations = iterationCount
+		}
 		// Cache timestamp to avoid multiple time.Now() calls in this iteration
 		now := time.Now()
 		timestamp := now.Format(time.RFC3339)
@@ -3715,15 +3727,18 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		// Always do at least one iteration to show current state
 		// After first iteration, check if monitoring should continue
-		shouldContinue := em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs)
-		if iterationCount == 1 && !shouldContinue {
-			// First iteration shows state, but we don't need to continue - exit immediately
-			fmt.Printf("\n") // Add final newline
-			break
-		} else if iterationCount > 1 && !shouldContinue {
-			// Subsequent iterations: exit when monitoring is complete
-			fmt.Printf("\n") // Add final newline
-			break
+		// Skip this check if infinite loop mode is enabled
+		if !em.infiniteLoop {
+			shouldContinue := em.ShouldContinueMonitoring(eipStats, cpicStats, overcommittedEIPs, totalAzureEIPs)
+			if iterationCount == 1 && !shouldContinue {
+				// First iteration shows state, but we don't need to continue - exit immediately
+				fmt.Printf("\n") // Add final newline
+				break
+			} else if iterationCount > 1 && !shouldContinue {
+				// Subsequent iterations: exit when monitoring is complete
+				fmt.Printf("\n") // Add final newline
+				break
+			}
 		}
 
 		// Sleep before next iteration
@@ -3738,6 +3753,11 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 // displayPerformanceStats displays and logs performance metrics
 func (em *EIPMonitor) displayPerformanceStats() {
+	// Check if performance monitoring is enabled
+	if em.perfMonitor == nil {
+		return
+	}
+
 	log.Println("displayPerformanceStats called")
 	// Check if monitoring was actually started
 	if em.perfMonitor.startTime.IsZero() {
@@ -5022,7 +5042,9 @@ func getColor(name string) color.Color {
 
 // Main CLI
 var (
-	outputDirVar string
+	outputDirVar     string
+	perfMonFlag      bool
+	infiniteLoopFlag bool
 )
 
 func validateEnvironment() (string, string, error) {
@@ -5286,8 +5308,8 @@ func cmdMonitor() error {
 		return err
 	}
 
-	// Create a temporary monitor just for the check
-	tempMonitor := &EIPMonitor{ocClient: ocClient}
+	// Create a temporary monitor just for the check (no perf monitoring needed for check)
+	tempMonitor := &EIPMonitor{ocClient: ocClient, perfMonitor: nil}
 	// Get overcommitted count for the check
 	overcommittedEIPs, err := ocClient.CountOvercommittedEIPObjects()
 	if err != nil {
@@ -5334,7 +5356,7 @@ func cmdMonitor() error {
 		outputDir = filepath.Join(tempBase, timestamp)
 	}
 
-	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
+	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, infiniteLoopFlag)
 	if err != nil {
 		return err
 	}
@@ -5390,8 +5412,8 @@ func cmdAll() error {
 		return err
 	}
 
-	// Create a temporary monitor just for the check
-	tempMonitor := &EIPMonitor{ocClient: ocClient}
+	// Create a temporary monitor just for the check (no perf monitoring needed for check)
+	tempMonitor := &EIPMonitor{ocClient: ocClient, perfMonitor: nil}
 	// Get overcommitted count for the check
 	overcommittedEIPs, err := ocClient.CountOvercommittedEIPObjects()
 	if err != nil {
@@ -5428,7 +5450,7 @@ func cmdAll() error {
 				outputDir = filepath.Join(tempBase, timestamp)
 			}
 
-			monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
+			monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, false)
 			if err != nil {
 				return err
 			}
@@ -5462,7 +5484,7 @@ func cmdAll() error {
 		outputDir = filepath.Join(tempBase, timestamp)
 	}
 
-	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup)
+	monitor, err := NewEIPMonitor(outputDir, subscriptionID, resourceGroup, perfMonFlag, false)
 	if err != nil {
 		return err
 	}
@@ -5512,6 +5534,8 @@ func main() {
 		},
 	}
 	monitorCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
+	monitorCmd.Flags().BoolVar(&perfMonFlag, "perfmon", false, "Enable performance monitoring")
+	monitorCmd.Flags().BoolVar(&infiniteLoopFlag, "infinite", false, "Run monitoring loop indefinitely (don't exit when monitoring is complete)")
 
 	var mergeCmd = &cobra.Command{
 		Use:   "merge [directory]",
@@ -5539,6 +5563,7 @@ func main() {
 		},
 	}
 	allCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
+	allCmd.Flags().BoolVar(&perfMonFlag, "perfmon", false, "Enable performance monitoring")
 
 	var monitorAsyncCmd = &cobra.Command{
 		Use:   "monitor-async",
@@ -5549,6 +5574,8 @@ func main() {
 		},
 	}
 	monitorAsyncCmd.Flags().StringVarP(&outputDirVar, "output-dir", "o", "", "Output base directory (timestamped subdirectory will be created; default: temp directory)")
+	monitorAsyncCmd.Flags().BoolVar(&perfMonFlag, "perfmon", false, "Enable performance monitoring")
+	monitorAsyncCmd.Flags().BoolVar(&infiniteLoopFlag, "infinite", false, "Run monitoring loop indefinitely (don't exit when monitoring is complete)")
 
 	var mergeOptimizedCmd = &cobra.Command{
 		Use:   "merge-optimized [directory]",
