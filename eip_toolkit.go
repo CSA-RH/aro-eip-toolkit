@@ -1566,6 +1566,210 @@ func (oc *OpenShiftClient) CountMalfunctioningEIPObjects(eipData, cpicData map[s
 	return len(malfunctioningResources), nil
 }
 
+// CountCriticalEIPObjects counts EIP objects (resources) that have no working node assignments
+// A critical EIP is one where:
+// - No nodes at all in status.items, OR
+// - Only nodes/IPs that are misaligned with their respective CPIC (all IPs in status.items have mismatches)
+// If eipData and cpicData are provided, they will be used instead of fetching again
+func (oc *OpenShiftClient) CountCriticalEIPObjects(eipData, cpicData map[string]interface{}) (int, error) {
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	if err != nil {
+		return 0, err
+	}
+
+	items, ok := eipData["items"].([]interface{})
+	if !ok {
+		return 0, nil
+	}
+
+	// Build map of IPs with mismatches by resource
+	resourceMismatchIPs := make(map[string]map[string]bool) // resource -> set of IPs with mismatches
+	for _, m := range mismatches {
+		if m.EIPResource != "" && m.IP != "" {
+			if resourceMismatchIPs[m.EIPResource] == nil {
+				resourceMismatchIPs[m.EIPResource] = make(map[string]bool)
+			}
+			resourceMismatchIPs[m.EIPResource][m.IP] = true
+		}
+	}
+
+	// Get CPIC IP->node mapping for verification
+	cpicIPToNode, err := oc.getIPToNodeMappingFromData(cpicData)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get CPIC IP to node mapping: %w", err)
+	}
+
+	// Build EIP IP->node mapping from status.items
+	eipIPToNode := make(map[string]string)
+	eipIPToResource := make(map[string]string)
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get EIP resource name/namespace
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		// Get IPs from status.items (those with node assignments)
+		status, ok := itemMap["status"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		spec, _ := itemMap["spec"].(map[string]interface{})
+		var configuredIPs []string
+		if spec != nil {
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ipVal := range egressIPs {
+					if ipStr, ok := ipVal.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+		}
+
+		if statusItems, ok := status["items"].([]interface{}); ok {
+			for i, statusItem := range statusItems {
+				statusItemMap, ok := statusItem.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				// Check if this item has a node assignment
+				nodeValue, hasNode := statusItemMap["node"]
+				if !hasNode || nodeValue == nil {
+					continue
+				}
+
+				var nodeStr string
+				switch v := nodeValue.(type) {
+				case string:
+					nodeStr = v
+				default:
+					nodeStr = fmt.Sprintf("%v", v)
+				}
+
+				if nodeStr == "" {
+					continue
+				}
+
+				// Get IP from status item
+				var ip string
+				if egressIPValue, hasIP := statusItemMap["egressIP"]; hasIP {
+					switch v := egressIPValue.(type) {
+					case string:
+						ip = v
+					default:
+						ip = fmt.Sprintf("%v", v)
+					}
+				} else if i < len(configuredIPs) {
+					// Fall back to positional mapping
+					ip = configuredIPs[i]
+				}
+
+				if ip != "" {
+					eipIPToNode[ip] = nodeStr
+					eipIPToResource[ip] = resourceName
+				}
+			}
+		}
+	}
+
+	// Build map of resources -> IPs in status.items
+	resourceStatusIPs := make(map[string]map[string]bool) // resource -> set of IPs in status.items
+	for ip, resourceName := range eipIPToResource {
+		if resourceName != "" {
+			if resourceStatusIPs[resourceName] == nil {
+				resourceStatusIPs[resourceName] = make(map[string]bool)
+			}
+			resourceStatusIPs[resourceName][ip] = true
+		}
+	}
+
+	// Identify critical EIPs
+	criticalResources := make(map[string]bool)
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		statusIPs := resourceStatusIPs[resourceName]
+		mismatchIPs := resourceMismatchIPs[resourceName]
+
+		// If no IPs in status.items at all, it's critical
+		if len(statusIPs) == 0 {
+			criticalResources[resourceName] = true
+			continue
+		}
+
+		// Check if ALL IPs in status.items have mismatches
+		allIPsHaveMismatches := true
+		for ip := range statusIPs {
+			// Check if this IP is in the mismatch list
+			if mismatchIPs != nil && mismatchIPs[ip] {
+				continue // This IP has a mismatch
+			}
+
+			// If not in mismatch list, verify it actually matches CPIC
+			eipNode := eipIPToNode[ip]
+			cpicNode, existsInCPIC := cpicIPToNode[ip]
+
+			if existsInCPIC && eipNode != cpicNode {
+				// Node mismatch - this IP is misaligned
+				continue
+			} else if !existsInCPIC {
+				// IP not in CPIC - could be misaligned, but be conservative
+				// Don't count as working
+				continue
+			} else if eipNode == cpicNode {
+				// IP matches CPIC - this is a working assignment
+				allIPsHaveMismatches = false
+				break
+			}
+		}
+
+		// If all IPs in status.items have mismatches, it's critical
+		if allIPsHaveMismatches && len(statusIPs) > 0 {
+			criticalResources[resourceName] = true
+		}
+	}
+
+	return len(criticalResources), nil
+}
+
 // DetectUnassignedEIPs finds EIPs that are configured but not assigned, and determines why
 // Uses the same logic as GetEIPStats: configured = len(spec.egressIPs), assigned = len(status.items with node)
 func (oc *OpenShiftClient) DetectUnassignedEIPs() ([]UnassignedEIP, error) {
@@ -3057,9 +3261,9 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 	// Track previous summary stats for highlighting
 	var prevSummary struct {
-		configured, requested, successful, assigned, cpicError int
-		cnccRunning, cnccReady                                 int
-		initialized                                            bool
+		configured, requested, successful, assigned, cpicError, critical int
+		cnccRunning, cnccReady                                           int
+		initialized                                                      bool
 	}
 
 	// Track progress detection for OVN-Kube warning
@@ -3141,12 +3345,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		// Get malfunctioning and overcommitted counts in parallel (using pre-fetched data)
-		var malfunctioningEIPs, overcommittedEIPs int
-		var malfunctionErr, overcommittedErr error
+		// Get malfunctioning, overcommitted, and critical counts in parallel (using pre-fetched data)
+		var malfunctioningEIPs, overcommittedEIPs, criticalEIPs int
+		var malfunctionErr, overcommittedErr, criticalErr error
 
 		var countWg sync.WaitGroup
-		countWg.Add(2)
+		countWg.Add(3)
 
 		go func() {
 			defer countWg.Done()
@@ -3156,6 +3360,11 @@ func (em *EIPMonitor) MonitorLoop() error {
 		go func() {
 			defer countWg.Done()
 			overcommittedEIPs, overcommittedErr = em.ocClient.CountOvercommittedEIPObjects(eipData)
+		}()
+
+		go func() {
+			defer countWg.Done()
+			criticalEIPs, criticalErr = em.ocClient.CountCriticalEIPObjects(eipData, cpicData)
 		}()
 
 		countWg.Wait()
@@ -3170,6 +3379,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			// Log error but don't fail - overcommitted count is optional
 			fmt.Fprintf(os.Stderr, "Warning: Failed to count overcommitted EIP objects: %v\n", overcommittedErr)
 			overcommittedEIPs = 0
+		}
+
+		if criticalErr != nil {
+			// Log error but don't fail - critical count is optional
+			fmt.Fprintf(os.Stderr, "Warning: Failed to count critical EIP objects: %v\n", criticalErr)
+			criticalEIPs = 0
 		}
 
 		// Get EIP resource count (number of EIP objects) from pre-fetched data
@@ -3199,6 +3414,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 		em.bufferedLogger.LogStats(timestamp, "overcommitted_eip_objects", map[string]interface{}{
 			"count": overcommittedEIPs,
+		})
+
+		em.bufferedLogger.LogStats(timestamp, "critical_eip_objects", map[string]interface{}{
+			"count": criticalEIPs,
 		})
 
 		// Collect node data in parallel (using pre-fetched EIP and CPIC data for better performance)
@@ -3282,65 +3501,6 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 			fmt.Printf("%s%s%s\n",
 				clearLine, nodeNameStr, outputStr)
-
-			// Display CPIC/Azure discrepancy details if detected and no progress for 10 iterations
-			if data.Discrepancy != nil && data.Discrepancy.Message != "" && noProgressDetected {
-				fmt.Printf("%s\033[33;1m⚠️  CPIC/Azure Discrepancy: %s\033[0m\n",
-					clearLine, data.Discrepancy.Message)
-
-				// Show detailed IPs (limit to first 10 for readability)
-				maxDisplay := 10
-				missingInAzureCount := len(data.Discrepancy.MissingInAzure)
-				missingInCPICCount := len(data.Discrepancy.MissingInCPIC)
-
-				if missingInAzureCount > 0 {
-					displayCount := missingInAzureCount
-					if displayCount > maxDisplay {
-						displayCount = maxDisplay
-					}
-
-					if missingInAzureCount > maxDisplay {
-						fmt.Printf("%s   Missing in Azure (%d shown of %d):\n", clearLine, displayCount, missingInAzureCount)
-					} else {
-						fmt.Printf("%s   Missing in Azure:\n", clearLine)
-					}
-
-					// Sort IPs for consistent output
-					sortedIPs := make([]string, displayCount)
-					copy(sortedIPs, data.Discrepancy.MissingInAzure[:displayCount])
-					sort.Strings(sortedIPs)
-
-					for _, ip := range sortedIPs {
-						displayStr := ip
-						if resource, ok := data.Discrepancy.IPToResource[ip]; ok && resource != "" {
-							displayStr = fmt.Sprintf("%s (%s)", ip, resource)
-						}
-						fmt.Printf("%s   - %s\n", clearLine, displayStr)
-					}
-				}
-
-				if missingInCPICCount > 0 {
-					displayCount := missingInCPICCount
-					if displayCount > maxDisplay {
-						displayCount = maxDisplay
-					}
-
-					if missingInCPICCount > maxDisplay {
-						fmt.Printf("%s   Missing in CPIC (%d shown of %d):\n", clearLine, displayCount, missingInCPICCount)
-					} else {
-						fmt.Printf("%s   Missing in CPIC:\n", clearLine)
-					}
-
-					// Sort IPs for consistent output
-					sortedIPs := make([]string, displayCount)
-					copy(sortedIPs, data.Discrepancy.MissingInCPIC[:displayCount])
-					sort.Strings(sortedIPs)
-
-					for _, ip := range sortedIPs {
-						fmt.Printf("%s   - %s\n", clearLine, ip)
-					}
-				}
-			}
 
 			// Log status changes
 			if hasPrev && prev.Status != data.Status {
@@ -3455,6 +3615,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			overcommittedStr = fmt.Sprintf("\033[33;1m%d\033[0m", overcommittedEIPs)
 		}
 
+		// Format critical EIPs - red if > 0 (more severe than malfunctioning)
+		criticalStr := fmt.Sprintf("%d", criticalEIPs)
+		if criticalEIPs > 0 && isTerminal {
+			criticalStr = fmt.Sprintf("\033[31;1m%d\033[0m", criticalEIPs)
+		}
+
 		// Format CNCC stats with highlighting
 		cnccRunningStr := formatValue(cnccStats.PodsRunning, prevSummary.initialized && prevSummary.cnccRunning != cnccStats.PodsRunning, isTerminal)
 		cnccReadyStr := formatValue(cnccStats.PodsReady, prevSummary.initialized && prevSummary.cnccReady != cnccStats.PodsReady, isTerminal)
@@ -3490,8 +3656,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
-			clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+		fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+			clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 
 		// Track if we need to display error/warning messages
 		hasErrorMessage := false
@@ -3652,6 +3818,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 		prevSummary.cpicError = cpicStats.Error
 		prevSummary.cnccRunning = cnccStats.PodsRunning
 		prevSummary.cnccReady = cnccStats.PodsReady
+		prevSummary.critical = criticalEIPs
 		prevSummary.initialized = true
 
 		// Update count of lines printed (timestamp + nodes + 1 summary line + optional error message)
@@ -5096,6 +5263,7 @@ func PrintCurrentState() error {
 
 	malfunctioningEIPs, _ := ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
 	overcommittedEIPs, _ := ocClient.CountOvercommittedEIPObjects(eipData)
+	criticalEIPs, _ := ocClient.CountCriticalEIPObjects(eipData, cpicData)
 
 	// Collect node data (using pre-fetched EIP and CPIC data for better performance)
 	var wg sync.WaitGroup
@@ -5211,6 +5379,12 @@ func PrintCurrentState() error {
 		malfunctionStr = fmt.Sprintf("\033[31;1m%d\033[0m", malfunctioningEIPs)
 	}
 
+	// Format critical EIPs - red if > 0 (more severe than malfunctioning)
+	criticalStr := fmt.Sprintf("%d", criticalEIPs)
+	if criticalEIPs > 0 && isTerminal {
+		criticalStr = fmt.Sprintf("\033[31;1m%d\033[0m", criticalEIPs)
+	}
+
 	// Format overcommitted EIPs - yellow if > 0
 	overcommittedStr := fmt.Sprintf("%d", overcommittedEIPs)
 	if overcommittedEIPs > 0 && isTerminal {
@@ -5277,8 +5451,8 @@ func PrintCurrentState() error {
 		}
 	}
 
-	fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
-		clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+	fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+		clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 	fmt.Printf("\n")
 
 	return nil

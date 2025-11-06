@@ -151,19 +151,37 @@ Set environment variables (see Installation section above for platform-specific 
 
 The toolkit supports shell completion for improved usability:
 
-**Bash/Zsh (Linux/macOS):**
+**Bash (Linux/macOS):**
 ```bash
 # For current session
-source <(eip-toolkit completion bash)  # for bash
-source <(eip-toolkit completion zsh)   # for zsh
+source <(eip-toolkit completion bash)
 
 # For permanent installation (bash)
 eip-toolkit completion bash > $(brew --prefix)/etc/bash_completion.d/eip-toolkit  # macOS
 # or
 eip-toolkit completion bash > /etc/bash_completion.d/eip-toolkit  # Linux
+```
+
+**Zsh (Linux/macOS):**
+```bash
+# First, ensure zsh completion system is initialized
+autoload -Uz compinit && compinit
+
+# For current session
+source <(eip-toolkit completion zsh)
 
 # For permanent installation (zsh)
+# Option 1: Using custom completion directory (recommended)
+mkdir -p ~/.zsh/completion
+eip-toolkit completion zsh > ~/.zsh/completion/_eip-toolkit
+# Then add to ~/.zshrc:
+# fpath=(~/.zsh/completion $fpath)
+# autoload -Uz compinit && compinit
+
+# Option 2: Direct to fpath directory (if fpath is already set)
 eip-toolkit completion zsh > "${fpath[1]}/_eip-toolkit"
+# Then reload completions:
+rm -f ~/.zcompdump* && compinit
 ```
 
 **PowerShell (Windows):**
