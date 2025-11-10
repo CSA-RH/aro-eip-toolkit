@@ -1257,12 +1257,14 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 
 	// Check for IPs in CPIC with CloudResponseSuccess but not in EIP status.items
 	// This indicates CPIC succeeded but EIP status hasn't been updated
-	// BUT: Don't flag if the EIP resource is already at capacity (one IP per available node)
+	// This is ALWAYS a mismatch - if CPIC shows an IP is assigned, EIP status should also show it
+	// The "at capacity" check should only apply to unassigned IPs, not mismatches
 	// Also exclude IPs from overcommitted resources
 	for ip, cpicNode := range cpicIPToNode {
 		_, existsInEIP := eipIPToNode[ip]
 		if !existsInEIP {
 			// IP is in CPIC with CloudResponseSuccess but not in EIP status.items
+			// This is a mismatch - CPIC shows assignment but EIP status doesn't
 			resourceName := eipResourceMap[ip]
 
 			// Skip IPs from overcommitted resources
@@ -1271,35 +1273,15 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 			}
 
 			if resourceName != "" {
-				// Check if this EIP resource is at capacity (has assigned IPs equal to available nodes)
-				// If so, unassigned IPs are legitimate (due to node capacity constraint)
-				assignedCount := eipResourceAssigned[resourceName]
-				configuredCount := eipResourceConfig[resourceName]
-
-				// Only flag as mismatch if:
-				// The resource has fewer assigned IPs than the maximum possible (min(configuredCount, availableNodeCount))
-				// This means: if assignedCount >= min(configuredCount, availableNodeCount), then remaining IPs are legitimately unassigned
-				isAtCapacity := false
-				if availableNodeCount > 0 {
-					maxPossibleAssignments := configuredCount
-					if configuredCount > availableNodeCount {
-						maxPossibleAssignments = availableNodeCount
-					}
-					if assignedCount >= maxPossibleAssignments {
-						isAtCapacity = true
-					}
-				}
-
-				if !isAtCapacity {
-					// This is a mismatch - CPIC shows it's assigned but EIP doesn't, and resource isn't at capacity
-					mismatches = append(mismatches, EIPCPICMismatch{
-						IP:           ip,
-						EIPNode:      "",
-						CPICNode:     cpicNode,
-						EIPResource:  resourceName,
-						MismatchType: "missing_in_eip",
-					})
-				}
+				// This is a mismatch - CPIC shows it's assigned but EIP doesn't
+				// Report it regardless of capacity, as this indicates EIP status is stale
+				mismatches = append(mismatches, EIPCPICMismatch{
+					IP:           ip,
+					EIPNode:      "",
+					CPICNode:     cpicNode,
+					EIPResource:  resourceName,
+					MismatchType: "missing_in_eip",
+				})
 			} else {
 				// IP is in CPIC but we can't determine which EIP resource it belongs to
 				// Try to find it by checking all EIP resources' spec.egressIPs
@@ -1483,30 +1465,15 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 						}
 					}
 					if !alreadyReported {
-						// Check if this EIP resource is at capacity
-						assignedCount := eipResourceAssigned[resourceName]
-						configuredCount := eipResourceConfig[resourceName]
-						isAtCapacity := false
-						if availableNodeCount > 0 {
-							maxPossibleAssignments := configuredCount
-							if configuredCount > availableNodeCount {
-								maxPossibleAssignments = availableNodeCount
-							}
-							if assignedCount >= maxPossibleAssignments {
-								isAtCapacity = true
-							}
-						}
-
-						if !isAtCapacity {
-							// This is a mismatch - IP has CPIC node assignment but not in EIP status.items, and resource isn't at capacity
-							mismatches = append(mismatches, EIPCPICMismatch{
-								IP:           ip,
-								EIPNode:      "",
-								CPICNode:     cpicNode,
-								EIPResource:  resourceName,
-								MismatchType: "missing_in_eip",
-							})
-						}
+						// This is a mismatch - IP has CPIC node assignment but not in EIP status.items
+						// Report it regardless of capacity, as this indicates EIP status is stale
+						mismatches = append(mismatches, EIPCPICMismatch{
+							IP:           ip,
+							EIPNode:      "",
+							CPICNode:     cpicNode,
+							EIPResource:  resourceName,
+							MismatchType: "missing_in_eip",
+						})
 					}
 				}
 			}
@@ -1536,29 +1503,15 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 				}
 				if !alreadyReported {
 					if resourceName != "" {
-						// Check if this EIP resource is at capacity
-						assignedCount := eipResourceAssigned[resourceName]
-						configuredCount := eipResourceConfig[resourceName]
-						isAtCapacity := false
-						if availableNodeCount > 0 {
-							maxPossibleAssignments := configuredCount
-							if configuredCount > availableNodeCount {
-								maxPossibleAssignments = availableNodeCount
-							}
-							if assignedCount >= maxPossibleAssignments {
-								isAtCapacity = true
-							}
-						}
-
-						if !isAtCapacity {
-							mismatches = append(mismatches, EIPCPICMismatch{
-								IP:           ip,
-								EIPNode:      "",
-								CPICNode:     cpicNode,
-								EIPResource:  resourceName,
-								MismatchType: "missing_in_eip",
-							})
-						}
+						// This is a mismatch - IP has CPIC node assignment but not in EIP status.items
+						// Report it regardless of capacity, as this indicates EIP status is stale
+						mismatches = append(mismatches, EIPCPICMismatch{
+							IP:           ip,
+							EIPNode:      "",
+							CPICNode:     cpicNode,
+							EIPResource:  resourceName,
+							MismatchType: "missing_in_eip",
+						})
 					} else {
 						// IP is in CPIC but we can't determine which EIP resource it belongs to
 						// Try to find it by checking all EIP resources' spec.egressIPs
@@ -3930,20 +3883,20 @@ func (em *EIPMonitor) LogClusterSummary(timestamp string, nodeData []*NodeEIPDat
 	// Write detailed summary (skip if in screen mode)
 	if em.logsDir != "" {
 		summaryFile := filepath.Join(em.logsDir, "cluster_eip_details.log")
-	f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+		f, err := os.OpenFile(summaryFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
 
-	fmt.Fprintf(f, "%s CLUSTER_SUMMARY\n", timestamp)
+		fmt.Fprintf(f, "%s CLUSTER_SUMMARY\n", timestamp)
 
-	// Sort node data for consistent ordering
-	sortedNodeData := make([]*NodeEIPData, len(nodeData))
-	copy(sortedNodeData, nodeData)
-	sort.Slice(sortedNodeData, func(i, j int) bool {
-		return sortedNodeData[i].Node < sortedNodeData[j].Node
-	})
+		// Sort node data for consistent ordering
+		sortedNodeData := make([]*NodeEIPData, len(nodeData))
+		copy(sortedNodeData, nodeData)
+		sort.Slice(sortedNodeData, func(i, j int) bool {
+			return sortedNodeData[i].Node < sortedNodeData[j].Node
+		})
 
 		for _, data := range sortedNodeData {
 			fmt.Fprintf(f, "%s %s %d %d %d %d\n", timestamp, data.Node, data.EIPAssigned, data.SecondaryEIPs, data.EIPAssigned+data.SecondaryEIPs, data.AzureEIPs)
@@ -6387,6 +6340,8 @@ func printMalfunctioningEIPs(ocClient *OpenShiftClient) error {
 				fmt.Printf("      IP: %s - EIP Node: %s, CPIC Node: %s (node mismatch)\n", m.IP, m.EIPNode, m.CPICNode)
 			} else if m.MismatchType == "missing_in_eip" {
 				fmt.Printf("      IP: %s - CPIC Node: %s (missing in EIP status)\n", m.IP, m.CPICNode)
+			} else if m.MismatchType == "missing_in_cpic" {
+				fmt.Printf("      IP: %s - EIP Node: %s (missing in CPIC)\n", m.IP, m.EIPNode)
 			} else {
 				fmt.Printf("      IP: %s - Type: %s\n", m.IP, m.MismatchType)
 			}
