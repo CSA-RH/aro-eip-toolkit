@@ -821,6 +821,101 @@ func (oc *OpenShiftClient) getIPToNodeMappingFromData(cpicData map[string]interf
 	return ipToNode, nil
 }
 
+// getIPToNodeMappingFromDataFiltered builds IP->node mapping from pre-fetched CPIC data
+// If ipToEIPResource is provided (non-nil), only includes IPs that are from EIP resources
+func (oc *OpenShiftClient) getIPToNodeMappingFromDataFiltered(cpicData map[string]interface{}, ipToEIPResource map[string]string) (map[string]string, error) {
+	ipToNode := make(map[string]string)
+	items, ok := cpicData["items"].([]interface{})
+	if !ok {
+		return ipToNode, nil
+	}
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		// Get IP address - try spec.ip first, fall back to resource name
+		var ipStr string
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			ipValue, ok := spec["ip"]
+			if ok {
+				switch v := ipValue.(type) {
+				case string:
+					ipStr = v
+				case nil:
+					// spec.ip is null, try resource name
+					break
+				default:
+					ipStr = fmt.Sprintf("%v", v)
+				}
+			}
+		}
+
+		// If spec.ip is null or empty, try using the resource name as the IP
+		if ipStr == "" {
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			if ok {
+				if name, ok := metadata["name"].(string); ok && name != "" {
+					ipStr = name
+				}
+			}
+		}
+
+		if ipStr == "" {
+			continue
+		}
+
+		// If filtering is enabled, only include IPs from EIP resources
+		if ipToEIPResource != nil {
+			if _, isEIPResourceIP := ipToEIPResource[ipStr]; !isEIPResourceIP {
+				continue
+			}
+		}
+
+		// Get the node assignment
+		nodeValue, ok := spec["node"]
+		if !ok {
+			continue
+		}
+		nodeStr := ""
+		switch v := nodeValue.(type) {
+		case string:
+			nodeStr = v
+		case nil:
+			continue
+		default:
+			nodeStr = fmt.Sprintf("%v", v)
+		}
+		if nodeStr == "" {
+			continue
+		}
+
+		// Check if CPIC has CloudResponseSuccess status (assigned)
+		status, ok := itemMap["status"].(map[string]interface{})
+		if ok {
+			conditions, ok := status["conditions"].([]interface{})
+			if ok {
+				for _, cond := range conditions {
+					condMap, ok := cond.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					reason, _ := condMap["reason"].(string)
+					if reason == "CloudResponseSuccess" {
+						ipToNode[ipStr] = nodeStr
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return ipToNode, nil
+}
+
 // EIPCPICMismatch represents a mismatch between EIP status and CPIC status
 type EIPCPICMismatch struct {
 	IP           string
@@ -876,8 +971,43 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 		availableNodeCount = len(availableNodes)
 	}
 
-	// Get CPIC IP->node mapping from provided data
-	cpicIPToNode, err := oc.getIPToNodeMappingFromData(cpicData)
+	// Build IP -> EIP resource map first (needed to filter CPIC to only EIP resource IPs)
+	ipToEIPResource := make(map[string]string)
+	eipItems, ok := eipData["items"].([]interface{})
+	if ok {
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			var resourceName string
+			if ok {
+				name, _ := metadata["name"].(string)
+				namespace, _ := metadata["namespace"].(string)
+				if namespace != "" {
+					resourceName = fmt.Sprintf("%s/%s", namespace, name)
+				} else {
+					resourceName = name
+				}
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if ok {
+				if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+					for _, ipVal := range egressIPs {
+						if ipStr, ok := ipVal.(string); ok {
+							ipToEIPResource[ipStr] = resourceName
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Get CPIC IP->node mapping from provided data, but filter to only EIP resource IPs
+	cpicIPToNode, err := oc.getIPToNodeMappingFromDataFiltered(cpicData, ipToEIPResource)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get CPIC IP to node mapping: %w", err)
 	}
@@ -891,10 +1021,11 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 	eipResourceConfig := make(map[string]int)   // resource -> configured IP count
 	eipResourceAssigned := make(map[string]int) // resource -> assigned IP count (in status.items with node)
 
-	items, ok := eipData["items"].([]interface{})
 	if !ok {
 		return mismatches, nil
 	}
+
+	items := eipItems
 
 	// First pass: identify overcommitted EIP resources and build the set
 	overcommittedResources := make(map[string]bool)
@@ -1050,7 +1181,8 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 
 	// Compare EIP and CPIC mappings
 	// Flag actual node assignment mismatches (where same IP is on different nodes)
-	// Also flag IPs in CPIC with CloudResponseSuccess but not in EIP status.items
+	// Also flag IPs in EIP status.items that are missing in CPIC (missing_in_cpic)
+	// Also flag IPs in CPIC with CloudResponseSuccess but not in EIP status.items (missing_in_eip)
 	// Exclude IPs from overcommitted resources
 	for ip, eipNode := range eipIPToNode {
 		// Skip IPs from overcommitted resources
@@ -1060,14 +1192,26 @@ func (oc *OpenShiftClient) DetectEIPCPICMismatchesWithData(eipData, cpicData map
 		}
 
 		cpicNode, existsInCPIC := cpicIPToNode[ip]
-		if existsInCPIC && eipNode != cpicNode {
-			// IP assigned to different nodes - this is a real mismatch
+		if existsInCPIC {
+			if eipNode != cpicNode {
+				// IP assigned to different nodes - this is a real mismatch
+				mismatches = append(mismatches, EIPCPICMismatch{
+					IP:           ip,
+					EIPNode:      eipNode,
+					CPICNode:     cpicNode,
+					EIPResource:  resourceName,
+					MismatchType: "node_mismatch",
+				})
+			}
+		} else {
+			// IP is in EIP status.items but NOT in CPIC with CloudResponseSuccess
+			// This indicates EIP status shows assignment but CPIC doesn't have it assigned
 			mismatches = append(mismatches, EIPCPICMismatch{
 				IP:           ip,
 				EIPNode:      eipNode,
-				CPICNode:     cpicNode,
+				CPICNode:     "",
 				EIPResource:  resourceName,
-				MismatchType: "node_mismatch",
+				MismatchType: "missing_in_cpic",
 			})
 		}
 	}
@@ -2584,6 +2728,43 @@ func (oc *OpenShiftClient) DetectUnassignedEIPs() ([]UnassignedEIP, error) {
 // GetNodeStatsFromData computes node stats from pre-fetched EIP and CPIC data
 // This is more efficient than GetNodeStats when data is already available
 func (oc *OpenShiftClient) GetNodeStatsFromData(nodeName string, eipData, cpicData map[string]interface{}) (*NodeStats, error) {
+	// Build IP -> EIP resource map from spec.egressIPs first
+	// This is needed to filter CPIC Success to only count IPs from EIP resources
+	ipToEIPResource := make(map[string]string)
+	eipItems, ok := eipData["items"].([]interface{})
+	if ok {
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			var resourceName string
+			if ok {
+				name, _ := metadata["name"].(string)
+				namespace, _ := metadata["namespace"].(string)
+				if namespace != "" {
+					resourceName = fmt.Sprintf("%s/%s", namespace, name)
+				} else {
+					resourceName = name
+				}
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if ok {
+				if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+					for _, ipVal := range egressIPs {
+						if ipStr, ok := ipVal.(string); ok {
+							ipToEIPResource[ipStr] = resourceName
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Count CPIC Success, Pending, and Error - but ONLY for IPs from EIP resources
 	cpicSuccess := 0
 	cpicPending := 0
 	cpicError := 0
@@ -2598,6 +2779,36 @@ func (oc *OpenShiftClient) GetNodeStatsFromData(nodeName string, eipData, cpicDa
 
 			spec, ok := itemMap["spec"].(map[string]interface{})
 			if !ok {
+				continue
+			}
+
+			// Get IP address from CPIC
+			var cpicIPStr string
+			if ipValue, ok := spec["ip"]; ok {
+				switch v := ipValue.(type) {
+				case string:
+					cpicIPStr = v
+				case nil:
+					// spec.ip is null, try resource name
+					if cpicMetadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+						if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+							cpicIPStr = name
+						}
+					}
+				default:
+					cpicIPStr = fmt.Sprintf("%v", v)
+				}
+			} else {
+				// spec.ip doesn't exist, try resource name
+				if cpicMetadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+					if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+						cpicIPStr = name
+					}
+				}
+			}
+
+			// Only count CPIC resources for IPs that are from EIP resources
+			if _, isEIPResourceIP := ipToEIPResource[cpicIPStr]; !isEIPResourceIP {
 				continue
 			}
 
@@ -2658,41 +2869,6 @@ func (oc *OpenShiftClient) GetNodeStatsFromData(nodeName string, eipData, cpicDa
 	// Primary EIP = the first IP in status.items of each EIP resource
 	// Each EIP resource contributes exactly ONE Primary EIP (the first IP in its status.items)
 	// Secondary EIPs = CPIC Success - Primary EIPs
-
-	// Build IP -> EIP resource map from spec.egressIPs
-	ipToEIPResource := make(map[string]string)
-	eipItems, ok := eipData["items"].([]interface{})
-	if ok {
-		for _, item := range eipItems {
-			itemMap, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			metadata, ok := itemMap["metadata"].(map[string]interface{})
-			var resourceName string
-			if ok {
-				name, _ := metadata["name"].(string)
-				namespace, _ := metadata["namespace"].(string)
-				if namespace != "" {
-					resourceName = fmt.Sprintf("%s/%s", namespace, name)
-				} else {
-					resourceName = name
-				}
-			}
-
-			spec, ok := itemMap["spec"].(map[string]interface{})
-			if ok {
-				if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
-					for _, ipVal := range egressIPs {
-						if ipStr, ok := ipVal.(string); ok {
-							ipToEIPResource[ipStr] = resourceName
-						}
-					}
-				}
-			}
-		}
-	}
 
 	// Count primary EIPs: the first IP in status.items of each EIP resource
 	// Only count if that first IP is assigned to this node
@@ -2925,7 +3101,11 @@ func (oc *OpenShiftClient) GetNodeStatsFromData(nodeName string, eipData, cpicDa
 		}
 	}
 
-	// Secondary EIPs = remaining IPs (CPIC Success - Primary EIPs)
+	// Secondary EIPs = CPIC Success - Primary EIPs
+	// This is the correct formula per METRICS_SPECIFICATION.md
+	// CPIC Success represents all IPs from EIP resources successfully assigned to this node
+	// Primary EIPs are the first IP from each EIP resource on this node
+	// Remaining IPs (CPIC Success - Primary) are Secondary EIPs
 	secondaryEIPs := 0
 	if cpicSuccess > primaryEIPs {
 		secondaryEIPs = cpicSuccess - primaryEIPs
