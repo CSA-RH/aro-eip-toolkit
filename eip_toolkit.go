@@ -1868,28 +1868,175 @@ func (oc *OpenShiftClient) CountCriticalEIPObjects(eipData, cpicData map[string]
 	return len(criticalResources), nil
 }
 
-// CountMalfunctioningCPICs counts CPICs that are involved in mismatches
+// CountMalfunctioningCPICs counts CPICs that are malfunctioning
 // A CPIC is malfunctioning if it has CloudResponseSuccess but:
 // - The IP doesn't exist in EIP status.items (missing_in_eip), OR
-// - The IP exists in EIP status.items but on a different node (node_mismatch)
+// - The IP exists in EIP status.items but on a different node (node_mismatch), OR
+// - It's not assigned to any EIP-enabled node (orphaned CPIC)
+// Note: We count ALL CPICs with Success that aren't on EIP-enabled nodes, not just EIP resource CPICs
 func (oc *OpenShiftClient) CountMalfunctioningCPICs(eipData, cpicData map[string]interface{}) (int, error) {
+	// Get EIP-enabled nodes
+	eipEnabledNodes, err := oc.GetEIPEnabledNodes()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get EIP-enabled nodes: %w", err)
+	}
+	eipEnabledNodeSet := make(map[string]bool)
+	for _, node := range eipEnabledNodes {
+		eipEnabledNodeSet[node] = true
+	}
+
+	// Build IP -> EIP resource map from spec.egressIPs
+	ipToEIPResource := make(map[string]bool) // Just track if IP is from EIP resource
+	eipItems, ok := eipData["items"].([]interface{})
+	if ok {
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if ok {
+				if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+					for _, ipVal := range egressIPs {
+						if ipStr, ok := ipVal.(string); ok {
+							ipToEIPResource[ipStr] = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Get mismatches to identify CPICs with EIP status mismatches
 	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
 	if err != nil {
 		return 0, err
 	}
 
-	// Count unique CPIC IPs involved in mismatches
-	// For missing_in_eip and node_mismatch, the CPIC IP is involved
-	malfunctioningCPICIPs := make(map[string]bool)
+	// Build set of CPIC IPs involved in mismatches
+	mismatchCPICIPs := make(map[string]bool)
 	for _, m := range mismatches {
 		if m.MismatchType == "missing_in_eip" || m.MismatchType == "node_mismatch" {
 			if m.IP != "" {
-				malfunctioningCPICIPs[m.IP] = true
+				mismatchCPICIPs[m.IP] = true
 			}
 		}
 	}
 
-	return len(malfunctioningCPICIPs), nil
+	// Count ALL CPICs with CloudResponseSuccess that aren't assigned to EIP-enabled nodes
+	// This includes both EIP resource CPICs and non-EIP resource CPICs
+	malfunctioningCPICCount := 0
+
+	cpicItems, ok := cpicData["items"].([]interface{})
+	if ok {
+		for _, item := range cpicItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Check if CPIC has CloudResponseSuccess
+			status, ok := itemMap["status"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			conditions, ok := status["conditions"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			hasCloudResponseSuccess := false
+			for _, cond := range conditions {
+				condMap, ok := cond.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				reason, _ := condMap["reason"].(string)
+				if reason == "CloudResponseSuccess" {
+					hasCloudResponseSuccess = true
+					break
+				}
+			}
+
+			if !hasCloudResponseSuccess {
+				continue
+			}
+
+			// Get IP address from CPIC (for mismatch checking)
+			var cpicIPStr string
+			if ipValue, ok := spec["ip"]; ok {
+				switch v := ipValue.(type) {
+				case string:
+					cpicIPStr = v
+				case nil:
+					if cpicMetadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+						if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+							cpicIPStr = name
+						}
+					}
+				default:
+					cpicIPStr = fmt.Sprintf("%v", v)
+				}
+			} else {
+				if cpicMetadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+					if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+						cpicIPStr = name
+					}
+				}
+			}
+
+			// Check if this CPIC has a mismatch (only for EIP resource CPICs)
+			hasMismatch := false
+			if cpicIPStr != "" && mismatchCPICIPs[cpicIPStr] {
+				hasMismatch = true
+			}
+
+			// Check if this is an EIP resource CPIC
+			isEIPResourceCPIC := cpicIPStr != "" && ipToEIPResource[cpicIPStr]
+
+			// Check if assigned to EIP-enabled node
+			nodeValue, ok := spec["node"]
+			if !ok {
+				// Not assigned to any node - this is malfunctioning
+				malfunctioningCPICCount++
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				// Node is null - not assigned to any node
+				malfunctioningCPICCount++
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			// Check if assigned to an EIP-enabled node
+			if !eipEnabledNodeSet[nodeStr] {
+				// Assigned to a node that's not EIP-enabled - this is malfunctioning
+				malfunctioningCPICCount++
+			} else if hasMismatch {
+				// Assigned to EIP-enabled node but has mismatch - this is malfunctioning
+				malfunctioningCPICCount++
+			} else if !isEIPResourceCPIC {
+				// Not an EIP resource CPIC - count as malfunctioning (orphaned CPIC not from EIP resources)
+				// This represents CPICs that exist but aren't being used by EIP
+				malfunctioningCPICCount++
+			}
+		}
+	}
+
+	return malfunctioningCPICCount, nil
 }
 
 // MalfunctioningEIPInfo contains information about a malfunctioning EIP resource
@@ -1900,10 +2047,11 @@ type MalfunctioningEIPInfo struct {
 
 // CriticalEIPInfo contains information about a critical EIP resource
 type CriticalEIPInfo struct {
-	Resource    string   // EIP resource name/namespace
-	Reason      string   // Why it's critical: "no_assignments" or "all_mismatches"
-	StatusIPs   []string // IPs in status.items (if any)
-	MismatchIPs []string // IPs with mismatches
+	Resource      string   // EIP resource name/namespace
+	Reason        string   // Why it's critical: "no_assignments" or "all_mismatches"
+	ConfiguredIPs []string // IPs configured in spec.egressIPs
+	StatusIPs     []string // IPs in status.items (if any)
+	MismatchIPs   []string // IPs with mismatches
 }
 
 // PrimaryEIPInfo contains information about a primary EIP assignment
@@ -2076,12 +2224,52 @@ func (oc *OpenShiftClient) ListCriticalEIPs(eipData, cpicData map[string]interfa
 
 	// Build map of resources -> IPs in status.items
 	resourceStatusIPs := make(map[string]map[string]bool) // resource -> set of IPs in status.items
+	resourceConfiguredIPs := make(map[string][]string)    // resource -> list of configured IPs
 	for ip, resourceName := range eipIPToResource {
 		if resourceName != "" {
 			if resourceStatusIPs[resourceName] == nil {
 				resourceStatusIPs[resourceName] = make(map[string]bool)
 			}
 			resourceStatusIPs[resourceName][ip] = true
+		}
+	}
+
+	// Build map of configured IPs by resource
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		metadata, ok := itemMap["metadata"].(map[string]interface{})
+		var resourceName string
+		if ok {
+			name, _ := metadata["name"].(string)
+			namespace, _ := metadata["namespace"].(string)
+			if namespace != "" {
+				resourceName = fmt.Sprintf("%s/%s", namespace, name)
+			} else {
+				resourceName = name
+			}
+		}
+
+		if resourceName == "" {
+			continue
+		}
+
+		spec, ok := itemMap["spec"].(map[string]interface{})
+		if ok {
+			var configuredIPs []string
+			if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+				for _, ipVal := range egressIPs {
+					if ipStr, ok := ipVal.(string); ok {
+						configuredIPs = append(configuredIPs, ipStr)
+					}
+				}
+			}
+			if len(configuredIPs) > 0 {
+				resourceConfiguredIPs[resourceName] = configuredIPs
+			}
 		}
 	}
 
@@ -2111,6 +2299,10 @@ func (oc *OpenShiftClient) ListCriticalEIPs(eipData, cpicData map[string]interfa
 
 		statusIPs := resourceStatusIPs[resourceName]
 		mismatchIPs := resourceMismatchIPs[resourceName]
+		configuredIPsList := resourceConfiguredIPs[resourceName]
+		if configuredIPsList == nil {
+			configuredIPsList = []string{}
+		}
 
 		// If no IPs in status.items at all, it's critical
 		if len(statusIPs) == 0 {
@@ -2120,11 +2312,13 @@ func (oc *OpenShiftClient) ListCriticalEIPs(eipData, cpicData map[string]interfa
 				mismatchIPsList = append(mismatchIPsList, ip)
 			}
 			sort.Strings(mismatchIPsList)
+			sort.Strings(configuredIPsList)
 			result = append(result, CriticalEIPInfo{
-				Resource:    resourceName,
-				Reason:      "no_assignments",
-				StatusIPs:   statusIPsList,
-				MismatchIPs: mismatchIPsList,
+				Resource:      resourceName,
+				Reason:        "no_assignments",
+				ConfiguredIPs: configuredIPsList,
+				StatusIPs:     statusIPsList,
+				MismatchIPs:   mismatchIPsList,
 			})
 			continue
 		}
@@ -2167,11 +2361,13 @@ func (oc *OpenShiftClient) ListCriticalEIPs(eipData, cpicData map[string]interfa
 			}
 			sort.Strings(statusIPsList)
 			sort.Strings(mismatchIPsList)
+			sort.Strings(configuredIPsList)
 			result = append(result, CriticalEIPInfo{
-				Resource:    resourceName,
-				Reason:      "all_mismatches",
-				StatusIPs:   statusIPsList,
-				MismatchIPs: mismatchIPsList,
+				Resource:      resourceName,
+				Reason:        "all_mismatches",
+				ConfiguredIPs: configuredIPsList,
+				StatusIPs:     statusIPsList,
+				MismatchIPs:   mismatchIPsList,
 			})
 		}
 	}
@@ -2190,14 +2386,24 @@ type MalfunctioningCPICInfo struct {
 	CPICNode     string // Node from CPIC status
 	EIPNode      string // Node from EIP status (if exists)
 	EIPResource  string // EIP resource name/namespace (if known)
-	MismatchType string // "node_mismatch" or "missing_in_eip"
+	MismatchType string // "node_mismatch", "missing_in_eip", "not_assigned", "non_eip_enabled_node", or "orphaned"
 }
 
-// ListMalfunctioningCPICs returns a list of malfunctioning CPICs (CPICs involved in mismatches)
+// ListMalfunctioningCPICs returns a list of malfunctioning CPICs
+// A CPIC is malfunctioning if it has CloudResponseSuccess but:
+// - The IP doesn't exist in EIP status.items (missing_in_eip), OR
+// - The IP exists in EIP status.items but on a different node (node_mismatch), OR
+// - It's not assigned to any EIP-enabled node (orphaned CPIC)
+// Note: We list ALL CPICs with Success that aren't on EIP-enabled nodes, not just EIP resource CPICs
 func (oc *OpenShiftClient) ListMalfunctioningCPICs(eipData, cpicData map[string]interface{}) ([]MalfunctioningCPICInfo, error) {
-	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	// Get EIP-enabled nodes
+	eipEnabledNodes, err := oc.GetEIPEnabledNodes()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get EIP-enabled nodes: %w", err)
+	}
+	eipEnabledNodeSet := make(map[string]bool)
+	for _, node := range eipEnabledNodes {
+		eipEnabledNodeSet[node] = true
 	}
 
 	// Build IP -> EIP resource map from spec.egressIPs
@@ -2235,22 +2441,169 @@ func (oc *OpenShiftClient) ListMalfunctioningCPICs(eipData, cpicData map[string]
 		}
 	}
 
-	// Collect CPICs involved in mismatches (only missing_in_eip and node_mismatch)
-	cpicMap := make(map[string]MalfunctioningCPICInfo) // IP -> CPIC info
+	// Get mismatches to identify CPICs with EIP status mismatches
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build set of CPIC IPs involved in mismatches
+	mismatchCPICIPs := make(map[string]bool)
+	mismatchInfoMap := make(map[string]EIPCPICMismatch) // IP -> mismatch info
 	for _, m := range mismatches {
 		if m.MismatchType == "missing_in_eip" || m.MismatchType == "node_mismatch" {
 			if m.IP != "" {
-				resourceName := m.EIPResource
-				if resourceName == "" {
-					// Try to find resource from IP map
-					resourceName = ipToEIPResource[m.IP]
+				mismatchCPICIPs[m.IP] = true
+				mismatchInfoMap[m.IP] = m
+			}
+		}
+	}
+
+	// Collect ALL CPICs with CloudResponseSuccess that aren't assigned to EIP-enabled nodes
+	// This includes both EIP resource CPICs and non-EIP resource CPICs
+	cpicMap := make(map[string]MalfunctioningCPICInfo) // IP -> CPIC info
+
+	cpicItems, ok := cpicData["items"].([]interface{})
+	if ok {
+		for _, item := range cpicItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			// Check if CPIC has CloudResponseSuccess
+			status, ok := itemMap["status"].(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			conditions, ok := status["conditions"].([]interface{})
+			if !ok {
+				continue
+			}
+
+			hasCloudResponseSuccess := false
+			for _, cond := range conditions {
+				condMap, ok := cond.(map[string]interface{})
+				if !ok {
+					continue
 				}
-				cpicMap[m.IP] = MalfunctioningCPICInfo{
-					IP:           m.IP,
-					CPICNode:     m.CPICNode,
-					EIPNode:      m.EIPNode,
+				reason, _ := condMap["reason"].(string)
+				if reason == "CloudResponseSuccess" {
+					hasCloudResponseSuccess = true
+					break
+				}
+			}
+
+			if !hasCloudResponseSuccess {
+				continue
+			}
+
+			// Get IP address from CPIC (for mismatch checking)
+			var cpicIPStr string
+			if ipValue, ok := spec["ip"]; ok {
+				switch v := ipValue.(type) {
+				case string:
+					cpicIPStr = v
+				case nil:
+					if cpicMetadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+						if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+							cpicIPStr = name
+						}
+					}
+				default:
+					cpicIPStr = fmt.Sprintf("%v", v)
+				}
+			} else {
+				if cpicMetadata, ok := itemMap["metadata"].(map[string]interface{}); ok {
+					if name, ok := cpicMetadata["name"].(string); ok && name != "" {
+						cpicIPStr = name
+					}
+				}
+			}
+
+			// Check if this CPIC has a mismatch (only for EIP resource CPICs)
+			hasMismatch := false
+			var mismatchInfo EIPCPICMismatch
+			if cpicIPStr != "" && mismatchCPICIPs[cpicIPStr] {
+				hasMismatch = true
+				mismatchInfo = mismatchInfoMap[cpicIPStr]
+			}
+
+			// Check if this is an EIP resource CPIC
+			isEIPResourceCPIC := cpicIPStr != "" && ipToEIPResource[cpicIPStr] != ""
+
+			// Get EIP resource name
+			resourceName := ipToEIPResource[cpicIPStr]
+			if hasMismatch && mismatchInfo.EIPResource != "" {
+				resourceName = mismatchInfo.EIPResource
+			}
+
+			// Check if assigned to EIP-enabled node
+			nodeValue, ok := spec["node"]
+			if !ok {
+				// Not assigned to any node - this is malfunctioning
+				cpicMap[cpicIPStr] = MalfunctioningCPICInfo{
+					IP:           cpicIPStr,
+					CPICNode:     "",
+					EIPNode:      "",
 					EIPResource:  resourceName,
-					MismatchType: m.MismatchType,
+					MismatchType: "not_assigned",
+				}
+				continue
+			}
+
+			var nodeStr string
+			switch v := nodeValue.(type) {
+			case string:
+				nodeStr = v
+			case nil:
+				// Node is null - not assigned to any node
+				cpicMap[cpicIPStr] = MalfunctioningCPICInfo{
+					IP:           cpicIPStr,
+					CPICNode:     "",
+					EIPNode:      "",
+					EIPResource:  resourceName,
+					MismatchType: "not_assigned",
+				}
+				continue
+			default:
+				nodeStr = fmt.Sprintf("%v", v)
+			}
+
+			// Check if assigned to an EIP-enabled node
+			if !eipEnabledNodeSet[nodeStr] {
+				// Assigned to a node that's not EIP-enabled - this is malfunctioning
+				cpicMap[cpicIPStr] = MalfunctioningCPICInfo{
+					IP:           cpicIPStr,
+					CPICNode:     nodeStr,
+					EIPNode:      "",
+					EIPResource:  resourceName,
+					MismatchType: "non_eip_enabled_node",
+				}
+			} else if hasMismatch {
+				// Assigned to EIP-enabled node but has mismatch - this is malfunctioning
+				cpicMap[cpicIPStr] = MalfunctioningCPICInfo{
+					IP:           cpicIPStr,
+					CPICNode:     mismatchInfo.CPICNode,
+					EIPNode:      mismatchInfo.EIPNode,
+					EIPResource:  resourceName,
+					MismatchType: mismatchInfo.MismatchType,
+				}
+			} else if !isEIPResourceCPIC {
+				// Not an EIP resource CPIC - count as malfunctioning (orphaned CPIC not from EIP resources)
+				// This represents CPICs that exist but aren't being used by EIP
+				cpicMap[cpicIPStr] = MalfunctioningCPICInfo{
+					IP:           cpicIPStr,
+					CPICNode:     nodeStr,
+					EIPNode:      "",
+					EIPResource:  "",
+					MismatchType: "orphaned",
 				}
 			}
 		}
@@ -6507,6 +6860,9 @@ func printCriticalEIPs(ocClient *OpenShiftClient) error {
 	for _, info := range critical {
 		fmt.Printf("\n  Resource: %s\n", info.Resource)
 		fmt.Printf("    Reason: %s\n", info.Reason)
+		if len(info.ConfiguredIPs) > 0 {
+			fmt.Printf("    Configured IPs: %s\n", strings.Join(info.ConfiguredIPs, ", "))
+		}
 		if len(info.StatusIPs) > 0 {
 			fmt.Printf("    Status IPs: %s\n", strings.Join(info.StatusIPs, ", "))
 		}
@@ -6591,6 +6947,12 @@ func printMalfunctioningCPICs(ocClient *OpenShiftClient) error {
 			fmt.Printf("  IP: %s - CPIC Node: %s, EIP Node: %s (node mismatch)", info.IP, info.CPICNode, info.EIPNode)
 		} else if info.MismatchType == "missing_in_eip" {
 			fmt.Printf("  IP: %s - CPIC Node: %s (missing in EIP status)", info.IP, info.CPICNode)
+		} else if info.MismatchType == "not_assigned" {
+			fmt.Printf("  IP: %s - (not assigned to any node)", info.IP)
+		} else if info.MismatchType == "non_eip_enabled_node" {
+			fmt.Printf("  IP: %s - CPIC Node: %s (assigned to non-EIP-enabled node)", info.IP, info.CPICNode)
+		} else if info.MismatchType == "orphaned" {
+			fmt.Printf("  IP: %s - CPIC Node: %s (orphaned CPIC not from EIP resources)", info.IP, info.CPICNode)
 		} else {
 			fmt.Printf("  IP: %s - Type: %s", info.IP, info.MismatchType)
 		}
