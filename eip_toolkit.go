@@ -1868,6 +1868,30 @@ func (oc *OpenShiftClient) CountCriticalEIPObjects(eipData, cpicData map[string]
 	return len(criticalResources), nil
 }
 
+// CountMalfunctioningCPICs counts CPICs that are involved in mismatches
+// A CPIC is malfunctioning if it has CloudResponseSuccess but:
+// - The IP doesn't exist in EIP status.items (missing_in_eip), OR
+// - The IP exists in EIP status.items but on a different node (node_mismatch)
+func (oc *OpenShiftClient) CountMalfunctioningCPICs(eipData, cpicData map[string]interface{}) (int, error) {
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	if err != nil {
+		return 0, err
+	}
+
+	// Count unique CPIC IPs involved in mismatches
+	// For missing_in_eip and node_mismatch, the CPIC IP is involved
+	malfunctioningCPICIPs := make(map[string]bool)
+	for _, m := range mismatches {
+		if m.MismatchType == "missing_in_eip" || m.MismatchType == "node_mismatch" {
+			if m.IP != "" {
+				malfunctioningCPICIPs[m.IP] = true
+			}
+		}
+	}
+
+	return len(malfunctioningCPICIPs), nil
+}
+
 // MalfunctioningEIPInfo contains information about a malfunctioning EIP resource
 type MalfunctioningEIPInfo struct {
 	Resource   string            // EIP resource name/namespace
@@ -2155,6 +2179,92 @@ func (oc *OpenShiftClient) ListCriticalEIPs(eipData, cpicData map[string]interfa
 	// Sort by resource name
 	sort.Slice(result, func(i, j int) bool {
 		return result[i].Resource < result[j].Resource
+	})
+
+	return result, nil
+}
+
+// MalfunctioningCPICInfo contains information about a malfunctioning CPIC
+type MalfunctioningCPICInfo struct {
+	IP           string // IP address
+	CPICNode     string // Node from CPIC status
+	EIPNode      string // Node from EIP status (if exists)
+	EIPResource  string // EIP resource name/namespace (if known)
+	MismatchType string // "node_mismatch" or "missing_in_eip"
+}
+
+// ListMalfunctioningCPICs returns a list of malfunctioning CPICs (CPICs involved in mismatches)
+func (oc *OpenShiftClient) ListMalfunctioningCPICs(eipData, cpicData map[string]interface{}) ([]MalfunctioningCPICInfo, error) {
+	mismatches, err := oc.DetectEIPCPICMismatchesWithData(eipData, cpicData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Build IP -> EIP resource map from spec.egressIPs
+	ipToEIPResource := make(map[string]string)
+	eipItems, ok := eipData["items"].([]interface{})
+	if ok {
+		for _, item := range eipItems {
+			itemMap, ok := item.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			metadata, ok := itemMap["metadata"].(map[string]interface{})
+			var resourceName string
+			if ok {
+				name, _ := metadata["name"].(string)
+				namespace, _ := metadata["namespace"].(string)
+				if namespace != "" {
+					resourceName = fmt.Sprintf("%s/%s", namespace, name)
+				} else {
+					resourceName = name
+				}
+			}
+
+			spec, ok := itemMap["spec"].(map[string]interface{})
+			if ok {
+				if egressIPs, ok := spec["egressIPs"].([]interface{}); ok {
+					for _, ipVal := range egressIPs {
+						if ipStr, ok := ipVal.(string); ok {
+							ipToEIPResource[ipStr] = resourceName
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Collect CPICs involved in mismatches (only missing_in_eip and node_mismatch)
+	cpicMap := make(map[string]MalfunctioningCPICInfo) // IP -> CPIC info
+	for _, m := range mismatches {
+		if m.MismatchType == "missing_in_eip" || m.MismatchType == "node_mismatch" {
+			if m.IP != "" {
+				resourceName := m.EIPResource
+				if resourceName == "" {
+					// Try to find resource from IP map
+					resourceName = ipToEIPResource[m.IP]
+				}
+				cpicMap[m.IP] = MalfunctioningCPICInfo{
+					IP:           m.IP,
+					CPICNode:     m.CPICNode,
+					EIPNode:      m.EIPNode,
+					EIPResource:  resourceName,
+					MismatchType: m.MismatchType,
+				}
+			}
+		}
+	}
+
+	// Convert map to list
+	var result []MalfunctioningCPICInfo
+	for _, info := range cpicMap {
+		result = append(result, info)
+	}
+
+	// Sort by IP address
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].IP < result[j].IP
 	})
 
 	return result, nil
@@ -4044,12 +4154,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		// Get malfunctioning, overcommitted, and critical counts in parallel (using pre-fetched data)
-		var malfunctioningEIPs, overcommittedEIPs, criticalEIPs int
-		var malfunctionErr, overcommittedErr, criticalErr error
+		// Get malfunctioning, overcommitted, critical, and malfunctioning CPIC counts in parallel (using pre-fetched data)
+		var malfunctioningEIPs, overcommittedEIPs, criticalEIPs, malfunctioningCPICs int
+		var malfunctionErr, overcommittedErr, criticalErr, malfunctionCPICErr error
 
 		var countWg sync.WaitGroup
-		countWg.Add(3)
+		countWg.Add(4)
 
 		go func() {
 			defer countWg.Done()
@@ -4066,12 +4176,23 @@ func (em *EIPMonitor) MonitorLoop() error {
 			criticalEIPs, criticalErr = em.ocClient.CountCriticalEIPObjects(eipData, cpicData)
 		}()
 
+		go func() {
+			defer countWg.Done()
+			malfunctioningCPICs, malfunctionCPICErr = em.ocClient.CountMalfunctioningCPICs(eipData, cpicData)
+		}()
+
 		countWg.Wait()
 
 		if malfunctionErr != nil {
 			// Log error but don't fail - malfunctioning count is optional
 			fmt.Fprintf(os.Stderr, "Warning: Failed to count malfunctioning EIP objects: %v\n", malfunctionErr)
 			malfunctioningEIPs = 0
+		}
+
+		if malfunctionCPICErr != nil {
+			// Log error but don't fail - malfunctioning CPIC count is optional
+			fmt.Fprintf(os.Stderr, "Warning: Failed to count malfunctioning CPICs: %v\n", malfunctionCPICErr)
+			malfunctioningCPICs = 0
 		}
 
 		if overcommittedErr != nil {
@@ -4333,6 +4454,12 @@ func (em *EIPMonitor) MonitorLoop() error {
 			criticalStr = fmt.Sprintf("\033[31;1m%d\033[0m", criticalEIPs)
 		}
 
+		// Format malfunctioning CPICs - red if > 0
+		malfunctionCPICStr := fmt.Sprintf("%d", malfunctioningCPICs)
+		if malfunctioningCPICs > 0 && isTerminal {
+			malfunctionCPICStr = fmt.Sprintf("\033[31;1m%d\033[0m", malfunctioningCPICs)
+		}
+
 		// Format CNCC stats with highlighting
 		cnccRunningStr := formatValue(cnccStats.PodsRunning, prevSummary.initialized && prevSummary.cnccRunning != cnccStats.PodsRunning, isTerminal)
 		cnccReadyStr := formatValue(cnccStats.PodsReady, prevSummary.initialized && prevSummary.cnccReady != cnccStats.PodsReady, isTerminal)
@@ -4368,8 +4495,8 @@ func (em *EIPMonitor) MonitorLoop() error {
 			}
 		}
 
-		fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
-			clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+		fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Malfunction CPICs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+			clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, malfunctionCPICStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 		os.Stdout.Sync() // Flush immediately after summary
 
 		// Track if we need to display error/warning messages
@@ -6060,14 +6187,15 @@ func getColor(name string) color.Color {
 
 // Main CLI
 var (
-	outputDirVar           string
-	perfMonFlag            bool
-	infiniteLoopFlag       bool
-	screenFlag             bool
-	listMalfunctioningFlag bool
-	listCriticalFlag       bool
-	listPrimaryFlag        bool
-	listSecondaryFlag      bool
+	outputDirVar               string
+	perfMonFlag                bool
+	infiniteLoopFlag           bool
+	screenFlag                 bool
+	listMalfunctioningFlag     bool
+	listCriticalFlag           bool
+	listPrimaryFlag            bool
+	listSecondaryFlag          bool
+	listMalfunctioningCPICFlag bool
 )
 
 func validateEnvironment() (string, string, error) {
@@ -6120,6 +6248,7 @@ func PrintCurrentState() error {
 	malfunctioningEIPs, _ := ocClient.CountMalfunctioningEIPObjects(eipData, cpicData)
 	overcommittedEIPs, _ := ocClient.CountOvercommittedEIPObjects(eipData)
 	criticalEIPs, _ := ocClient.CountCriticalEIPObjects(eipData, cpicData)
+	malfunctioningCPICs, _ := ocClient.CountMalfunctioningCPICs(eipData, cpicData)
 
 	// Collect node data (using pre-fetched EIP and CPIC data for better performance)
 	var wg sync.WaitGroup
@@ -6235,6 +6364,12 @@ func PrintCurrentState() error {
 		malfunctionStr = fmt.Sprintf("\033[31;1m%d\033[0m", malfunctioningEIPs)
 	}
 
+	// Format malfunctioning CPICs - red if > 0
+	malfunctionCPICStr := fmt.Sprintf("%d", malfunctioningCPICs)
+	if malfunctioningCPICs > 0 && isTerminal {
+		malfunctionCPICStr = fmt.Sprintf("\033[31;1m%d\033[0m", malfunctioningCPICs)
+	}
+
 	// Format critical EIPs - red if > 0 (more severe than malfunctioning)
 	criticalStr := fmt.Sprintf("%d", criticalEIPs)
 	if criticalEIPs > 0 && isTerminal {
@@ -6307,8 +6442,8 @@ func PrintCurrentState() error {
 		}
 	}
 
-	fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
-		clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
+	fmt.Printf("%s%s Configured EIPs: %s, Requested EIPs: %s, Successful CPICs: %s, Assigned EIP: %s, Malfunction EIPs: %s, Malfunction CPICs: %s, Critical EIPs: %s, Overcommitted EIPs: %s, CNCC: %s/%s%s%s\n",
+		clearLine, summaryLabel, configuredStr, requestedStr, successfulStr, assignedStr, malfunctionStr, malfunctionCPICStr, criticalStr, overcommittedStr, cnccRunningStr, cnccReadyStr, cnccQueueStr, capacityStr)
 	fmt.Printf("\n")
 
 	return nil
@@ -6433,6 +6568,41 @@ func printSecondaryEIPs(ocClient *OpenShiftClient) error {
 	return nil
 }
 
+// printMalfunctioningCPICs prints a list of malfunctioning CPICs
+func printMalfunctioningCPICs(ocClient *OpenShiftClient) error {
+	eipData, cpicData, err := ocClient.FetchEIPAndCPICData()
+	if err != nil {
+		return err
+	}
+
+	malfunctioning, err := ocClient.ListMalfunctioningCPICs(eipData, cpicData)
+	if err != nil {
+		return err
+	}
+
+	if len(malfunctioning) == 0 {
+		fmt.Println("No malfunctioning CPICs found.")
+		return nil
+	}
+
+	fmt.Printf("Malfunctioning CPICs (%d):\n", len(malfunctioning))
+	for _, info := range malfunctioning {
+		if info.MismatchType == "node_mismatch" {
+			fmt.Printf("  IP: %s - CPIC Node: %s, EIP Node: %s (node mismatch)", info.IP, info.CPICNode, info.EIPNode)
+		} else if info.MismatchType == "missing_in_eip" {
+			fmt.Printf("  IP: %s - CPIC Node: %s (missing in EIP status)", info.IP, info.CPICNode)
+		} else {
+			fmt.Printf("  IP: %s - Type: %s", info.IP, info.MismatchType)
+		}
+		if info.EIPResource != "" {
+			fmt.Printf(", EIP Resource: %s", info.EIPResource)
+		}
+		fmt.Printf("\n")
+	}
+
+	return nil
+}
+
 func cmdMonitor() error {
 	// Verify system:admin access before proceeding
 	ocClient := NewOpenShiftClient()
@@ -6452,6 +6622,9 @@ func cmdMonitor() error {
 	}
 	if listSecondaryFlag {
 		return printSecondaryEIPs(ocClient)
+	}
+	if listMalfunctioningCPICFlag {
+		return printMalfunctioningCPICs(ocClient)
 	}
 
 	subscriptionID, resourceGroup, err := validateEnvironment()
@@ -6725,6 +6898,7 @@ func main() {
 	monitorCmd.Flags().BoolVar(&listCriticalFlag, "list-critical", false, "List critical EIP resources and exit")
 	monitorCmd.Flags().BoolVar(&listPrimaryFlag, "list-primary", false, "List primary EIP assignments and exit")
 	monitorCmd.Flags().BoolVar(&listSecondaryFlag, "list-secondary", false, "List secondary EIP assignments and exit")
+	monitorCmd.Flags().BoolVar(&listMalfunctioningCPICFlag, "list-malfunctioning-cpic", false, "List malfunctioning CPICs and exit")
 
 	var mergeCmd = &cobra.Command{
 		Use:   "merge [directory]",
