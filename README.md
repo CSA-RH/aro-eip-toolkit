@@ -147,6 +147,34 @@ Set environment variables (see Installation section above for platform-specific 
   - Exit without creating directories, logs, or graphs
   - This allows quick status checks without generating files
 
+**List Commands:**
+The monitor command supports several list flags that display information and exit immediately:
+
+```bash
+# List malfunctioning EIP resources (EIPs with mismatches between status.items and CPIC)
+./eip-toolkit monitor --list-malfunctioning
+
+# List critical EIP resources (EIPs with no working assignments)
+./eip-toolkit monitor --list-critical
+
+# List primary EIP assignments (first IP from each EIP resource)
+./eip-toolkit monitor --list-primary
+
+# List secondary EIP assignments (additional IPs from EIP resources)
+./eip-toolkit monitor --list-secondary
+
+# List malfunctioning CPICs (includes all types of malfunctioning CPICs)
+./eip-toolkit monitor --list-malfunctioning-cpic
+```
+
+**Malfunctioning CPICs:**
+The `--list-malfunctioning-cpic` command lists all CPICs with `CloudResponseSuccess` that are considered malfunctioning:
+- **node_mismatch**: IP exists in EIP status.items but on a different node than CPIC assignment
+- **missing_in_eip**: IP doesn't exist in EIP status.items (CPIC reports success but EIP doesn't have it)
+- **not_assigned**: CPIC is not assigned to any node
+- **non_eip_enabled_node**: CPIC is assigned to a node that's not EIP-enabled
+- **orphaned**: CPIC is not from any EIP resource (exists but not being used by EIP)
+
 ### Shell Completion
 
 The toolkit supports shell completion for improved usability:
@@ -353,7 +381,7 @@ User
 The monitoring command displays:
 - Timestamp at the top of each iteration
 - Per-node statistics: CPIC (success/pending/error), Assigned EIP (primary/secondary), Azure NIC stats
-- Cluster summary: Configured EIPs, Successful CPICs, Assigned EIP (primary/secondary), Malfunction EIPs, Overcommitted EIPs, CNCC status
+- Cluster summary: Configured EIPs, Successful CPICs, Assigned EIP (primary/secondary), Malfunction EIPs, Malfunction CPICs, Overcommitted EIPs, CNCC status
 - Changed values highlighted in yellow/bold
 - Output overwrites previous lines using ANSI escape codes (terminal only)
 - After 10 iterations without progress:
@@ -361,13 +389,14 @@ The monitoring command displays:
   - CPIC/Azure discrepancies (when CPIC Success, Total Assigned EIPs, and Azure IPs don't match)
   - Unassigned EIPs
   - CPIC errors
+  - OVN-Kube troubleshooting warning (if no progress detected and no CPIC errors)
 
 Example output:
 ```
 2025/11/04 17:55:22
 aro-worker-node1 - CPIC: 32/0/0, Assigned EIP: 30/2, Azure: 32/0, Capacity: 223/255
 aro-worker-node2 - CPIC: 33/0/0, Assigned EIP: 31/2, Azure: 33/0, Capacity: 222/255
-Cluster Summary: Configured EIPs: 100, Requested EIPs: 100, Successful CPICs: 100, Assigned EIP: 61/4, Malfunction EIPs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 342/512
+Cluster Summary: Configured EIPs: 100, Requested EIPs: 100, Successful CPICs: 100, Assigned EIP: 61/4, Malfunction EIPs: 0, Malfunction CPICs: 0, Overcommitted EIPs: 5, CNCC: 2/2, Total Capacity: 342/512
 ```
 
 Example with CPIC/Azure discrepancy:
@@ -390,6 +419,7 @@ Note: Capacity values show available/total (e.g., "223/255" means 223 available 
 - **Assigned EIP**: Displayed as "x/y" where x is Primary EIPs and y is Secondary EIPs. Total (x+y) should match CPIC Success count.
 - **Azure IPs**: Actual secondary IPs configured on the Azure NIC. Should match CPIC Success and Total Assigned EIPs.
 - **Malfunction EIPs**: EIP resources where `status.items` don't match CPIC assignments. Red if > 0.
+- **Malfunction CPICs**: CPICs with `CloudResponseSuccess` that are malfunctioning (not assigned, assigned to non-EIP-enabled nodes, have mismatches, or are orphaned). Red if > 0.
 - **Overcommitted EIPs**: EIP resources with more IPs configured than available nodes. Yellow if > 0.
 
 **Expected Relationships:**
@@ -434,6 +464,48 @@ Where `expectedAssignable = Configured - unassignableIPs` (accounting for overco
 **Unassigned EIP Detection:**
 - Detected after 10 iterations without progress
 - Only shown if no mismatches detected (to avoid duplicate reporting)
+
+**Progress Detection and Warnings:**
+- The tool tracks progress in EIP assignments and CPIC status
+- After 10 iterations without progress (and no CPIC errors), a warning is displayed:
+  - Shows OVN-Kube troubleshooting commands
+  - Warning persists on screen until progress is detected
+- When progress is detected:
+  - The warning message is automatically cleared
+  - Normal monitoring output resumes
+  - Progress counter is reset
+- This ensures warnings only appear when truly needed and disappear when the situation improves
+
+**Interpreting Malfunction and Critical Counts:**
+- During assignment and redistribution, it is **normal and expected** to see elevated values for:
+  - Malfunction EIPs (e.g., 7)
+  - Malfunction CPICs (e.g., 44)
+  - Critical EIPs (e.g., 91)
+- These values indicate resources in transition as the system assigns and redistributes IPs
+- **However**, if these values remain unchanged for 10 iterations without progress, this indicates:
+  - Corrupt or stale EIP/CPIC resources
+  - Resources that are stuck in an inconsistent state
+  - Potential issues requiring investigation (check OVN-Kube logs, restart pods, or clean up stale resources)
+- The tool will display detailed mismatch information and troubleshooting commands when no progress is detected for 10 iterations
+
+**Recovery Steps for Malfunctioning CPICs:**
+If malfunctioning CPICs persist without progress for 10 iterations, follow these recovery steps:
+
+1. **Clean up malfunctioning CPICs:**
+   ```bash
+   deploy-test-ip cleanup malfunctioning cpic
+   ```
+
+2. **Restart OVN-Kube pods:**
+   ```bash
+   oc delete pods -n openshift-ovn-kubernetes -l app=ovnkube-control-plane
+   oc delete pods -n openshift-ovn-kubernetes -l app=ovnkube-node
+   ```
+
+3. **Monitor progress:**
+   - Continue monitoring with `./eip-toolkit monitor`
+   - Verify that malfunctioning CPIC counts decrease as resources are cleaned up and reassigned
+   - Progress should be detected within a few iterations after cleanup
 
 ### Logged Metrics
 

@@ -4417,6 +4417,7 @@ func (em *EIPMonitor) MonitorLoop() error {
 	prevLinesPrinted := 0              // Track previous iteration's line count for cursor movement
 	prevMismatchCount := 0             // Track previous iteration's mismatch count to detect when mismatches are resolved
 	prevIterationsWithoutProgress := 0 // Track previous iteration's progress state
+	prevWarningShown := false          // Track whether warning was shown in previous iteration
 
 	// Track previous values for highlighting changes
 	prevValues := make(map[string]*NodeEIPData)
@@ -4963,6 +4964,10 @@ func (em *EIPMonitor) MonitorLoop() error {
 
 				if progressMade {
 					// Progress detected, reset counter and update baseline (use totalAssignedEIPs for consistency)
+					// If warning was previously shown, reset hasErrorMessage to clear warning output
+					if progressTracker.warningShown && cpicStats.Error == 0 && mismatchCount == 0 {
+						hasErrorMessage = false
+					}
 					progressTracker.iterationsWithoutProgress = 0
 					progressTracker.warningShown = false
 					progressTracker.baselineEIPAssigned = totalAssignedEIPs
@@ -5034,7 +5039,20 @@ func (em *EIPMonitor) MonitorLoop() error {
 		mismatchesResolved := prevMismatchCount > 0 && mismatchCount == 0
 		shouldClearLines := prevLinesPrinted > linesPrinted && isTerminal && (progressDetected || mismatchesResolved)
 
-		if shouldClearLines {
+		// If progress was detected and warning was shown in previous iteration, ensure we clear warning lines
+		// This handles the case where warning lines need to be cleared even if line count calculation is off
+		if progressDetected && prevWarningShown && isTerminal {
+			// We need to clear the warning lines that are still on screen
+			// Calculate lines to clear: difference between previous and current line counts
+			linesToClear := prevLinesPrinted - linesPrinted
+			if linesToClear > 0 {
+				for i := 0; i < linesToClear; i++ {
+					fmt.Printf("\033[K\n") // Clear line and move to next
+				}
+				// Move back up to end of new content
+				fmt.Printf("\033[%dA", linesToClear)
+			}
+		} else if shouldClearLines {
 			// After printing new (shorter) content, we need to clear the remaining old lines
 			// At this point:
 			// - We moved up prevLinesPrinted at the start of iteration
@@ -5075,10 +5093,11 @@ func (em *EIPMonitor) MonitorLoop() error {
 			totalAzureLBs += data.AzureLBs
 		}
 
-		// Store current linesPrinted, mismatchCount, and progress state for next iteration's cursor movement
+		// Store current linesPrinted, mismatchCount, progress state, and warning state for next iteration's cursor movement
 		prevLinesPrinted = linesPrinted
 		prevMismatchCount = mismatchCount
 		prevIterationsWithoutProgress = progressTracker.iterationsWithoutProgress
+		prevWarningShown = progressTracker.warningShown
 
 		// Always do at least one iteration to show current state
 		// After first iteration, check if monitoring should continue
